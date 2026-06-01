@@ -449,11 +449,21 @@ class NixlConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
-        self._sending_write_transfers = defaultdict[
-            ReqId, list[tuple[TransferHandle, int]]
-        ](list)
-        self._done_sending_from_poller: set[ReqId] = set()
-        self._done_sending_from_poller_lock = threading.Lock()
+        self.num_write_sender_workers = int(
+            self.kv_transfer_config.get_from_extra_config(
+                "num_write_workers",
+                self.kv_transfer_config.get_from_extra_config("num_workers", 4),
+            )
+        )
+        if self.num_write_sender_workers <= 0:
+            raise ValueError("NIXL num_write_workers must be positive")
+        self._write_req_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self._write_sender_executor: ThreadPoolExecutor | None = None
+        self._write_sender_futures: list[Future[None]] = []
+        self._done_sending_from_background: set[ReqId] = set()
+        self._done_sending_from_background_lock = threading.Lock()
+        self._done_recving_from_background: set[ReqId] = set()
+        self._done_recving_from_background_lock = threading.Lock()
         self._write_req_poller_stop_event = threading.Event()
         self._write_req_poller_t: threading.Thread | None = None
         self._write_full_hit_reqs: set[ReqId] = set()
@@ -1003,16 +1013,24 @@ class NixlConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
-        if (
-            self.kv_transfer_config.is_kv_producer
-            and self._write_req_poller_t is None
-        ):
-            self._write_req_poller_t = threading.Thread(
-                target=self._poll_write_req_loop,
-                daemon=True,
-                name="nixl_write_req_poller",
-            )
-            self._write_req_poller_t.start()
+        if self.kv_transfer_config.is_kv_producer:
+            if self._write_sender_executor is None:
+                self._write_sender_executor = ThreadPoolExecutor(
+                    max_workers=self.num_write_sender_workers,
+                    thread_name_prefix="vllm-nixl-write-sender",
+                    initializer=self._bind_write_sender_thread_device,
+                )
+                self._write_sender_futures = [
+                    self._write_sender_executor.submit(self._write_sender_loop)
+                    for _ in range(self.num_write_sender_workers)
+                ]
+            if self._write_req_poller_t is None:
+                self._write_req_poller_t = threading.Thread(
+                    target=self._poll_write_req_loop,
+                    daemon=True,
+                    name="nixl_write_req_poller",
+                )
+                self._write_req_poller_t.start()
 
     def _build_mamba_local(
         self,
@@ -1707,12 +1725,16 @@ class NixlConnectorWorker:
         to track which workers are done.
         """
         assert self.transfer_topo is not None
-        if self.kv_transfer_config.is_kv_producer:
-            done_sending = self._drain_poller_done_sending()
-            done_recving = set[ReqId]()
-        else:
-            done_sending = set[ReqId]()
-            done_recving = self._drain_write_done_notifs()
+        done_sending = (
+            self._drain_background_done_sending()
+            if self.kv_transfer_config.is_kv_producer
+            else set[ReqId]()
+        )
+        done_recving = (
+            self._drain_write_done_notifs()
+            if self.kv_transfer_config.is_kv_consumer
+            else set[ReqId]()
+        )
 
         # Drain queue of requests where handshake or transfer setup failed.
         failed_recv_reqs = set[ReqId]()
@@ -1788,7 +1810,7 @@ class NixlConnectorWorker:
             # Sorted dict, oldest requests are put first so we can exit early.
             if now < expires:
                 break
-            with self._done_sending_from_poller_lock:
+            with self._done_sending_from_background_lock:
                 count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
@@ -1989,15 +2011,27 @@ class NixlConnectorWorker:
                     for notif in notifs:
                         had_work = True
                         if notif.startswith(WRITE_REQ_MSG_PREFIX):
-                            payload = msgspec.msgpack.decode(
-                                notif[len(WRITE_REQ_MSG_PREFIX) :]
-                            )
-                            self._handle_write_req(payload)
+                            try:
+                                payload = msgspec.msgpack.decode(
+                                    notif[len(WRITE_REQ_MSG_PREFIX) :]
+                                )
+                                self._write_req_queue.put(payload)
+                            except Exception:
+                                logger.exception(
+                                    "Failed to enqueue NIXL WRITE request"
+                                )
                         elif notif.startswith(WRITE_DONE_MSG_PREFIX):
-                            logger.warning(
-                                "Unexpected write_done on producer rank %s",
-                                self.tp_rank,
-                            )
+                            if self.kv_transfer_config.is_kv_consumer:
+                                req_id = notif[
+                                    len(WRITE_DONE_MSG_PREFIX) :
+                                ].decode("utf-8")
+                                with self._done_recving_from_background_lock:
+                                    self._done_recving_from_background.add(req_id)
+                            else:
+                                logger.warning(
+                                    "Unexpected write_done on producer rank %s",
+                                    self.tp_rank,
+                                )
                         else:
                             msg = notif.decode("utf-8")
                             if msg.startswith("HB:"):
@@ -2005,19 +2039,40 @@ class NixlConnectorWorker:
                             else:
                                 self._handle_write_free_notif(notif)
 
-                self._pop_done_write_transfers()
-
                 if not had_work:
                     time.sleep(0.001)
             except Exception:
                 logger.exception("NIXL WRITE poller exception")
                 time.sleep(0.01)
 
+    def _bind_write_sender_thread_device(self) -> None:
+        if not self.use_host_buffer:
+            current_platform.set_device(self.device_id)
+
+    def _write_sender_loop(self) -> None:
+        while True:
+            try:
+                payload = self._write_req_queue.get(timeout=0.1)
+            except queue.Empty:
+                if self._write_req_poller_stop_event.is_set():
+                    return
+                continue
+
+            try:
+                if payload is None or self._write_req_poller_stop_event.is_set():
+                    return
+                self._handle_write_req(payload)
+            except Exception:
+                logger.exception("NIXL WRITE sender worker exception")
+            finally:
+                self._write_req_queue.task_done()
+
     def _handle_write_req(self, payload: dict[str, Any]) -> None:
         decode_engine_id = payload["decode_engine_id"]
         decode_tp_size = int(payload["decode_tp_size"])
         decode_tp_rank = int(payload["decode_tp_rank"])
         prefill_req_id = payload["prefill_req_id"]
+        mark_done = True
 
         try:
             if decode_tp_rank not in self._remote_agents.get(decode_engine_id, {}):
@@ -2035,7 +2090,7 @@ class NixlConnectorWorker:
                             agent_name
                         )
 
-            posted = self._write_blocks(
+            mark_done = self._write_blocks(
                 prefill_req_id=prefill_req_id,
                 decode_req_id=payload["decode_req_id"],
                 decode_engine_id=decode_engine_id,
@@ -2044,8 +2099,6 @@ class NixlConnectorWorker:
                 prefill_block_ids=[list(g) for g in payload["prefill_block_ids"]],
                 decode_block_ids=[list(g) for g in payload["decode_block_ids"]],
             )
-            if not posted:
-                self._mark_write_send_done(prefill_req_id, decode_tp_size)
         except Exception as e:
             self._log_failure(
                 failure_type="write_request_processing_failed",
@@ -2055,7 +2108,9 @@ class NixlConnectorWorker:
                 decode_tp_rank=decode_tp_rank,
             )
             self.xfer_stats.record_failed_transfer()
-            self._mark_write_send_done(prefill_req_id, decode_tp_size)
+        finally:
+            if mark_done:
+                self._mark_write_send_done(prefill_req_id, decode_tp_size)
 
     def _write_blocks(
         self,
@@ -2081,7 +2136,7 @@ class NixlConnectorWorker:
 
         if all(len(g) == 0 for g in dst_groups):
             self._send_write_done_notif(decode_engine_id, decode_tp_rank, decode_req_id)
-            return False
+            return True
 
         src_desc_ids = self._compute_desc_ids(
             block_ids=src_groups,
@@ -2115,10 +2170,7 @@ class NixlConnectorWorker:
                 notif_msg=WRITE_DONE_MSG_PREFIX + decode_req_id.encode("utf-8"),
             )
             self.nixl_wrapper.transfer(handle)
-            self._sending_write_transfers[prefill_req_id].append(
-                (handle, decode_tp_size)
-            )
-            return True
+            return self._wait_for_write_handle(prefill_req_id, handle)
         except Exception as e:
             self._log_failure(
                 failure_type="write_transfer_setup_failed",
@@ -2130,41 +2182,38 @@ class NixlConnectorWorker:
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
-            self._mark_write_send_done(prefill_req_id, decode_tp_size)
             return True
 
-    def _pop_done_write_transfers(self) -> None:
-        for req_id, handles in list(self._sending_write_transfers.items()):
-            in_progress: list[tuple[TransferHandle, int]] = []
-            for handle, decode_tp_size in handles:
-                try:
-                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                except Exception:
-                    logger.exception("Error checking WRITE state for req %s", req_id)
-                    self.xfer_stats.record_failed_transfer()
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                    self._mark_write_send_done(req_id, decode_tp_size)
-                    continue
+    def _wait_for_write_handle(self, req_id: ReqId, handle: TransferHandle) -> bool:
+        try:
+            while not self._write_req_poller_stop_event.is_set():
+                xfer_state = self.nixl_wrapper.check_xfer_state(handle)
                 if xfer_state == "DONE":
                     res = self.nixl_wrapper.get_xfer_telemetry(handle)
                     self.xfer_stats.record_transfer(res)
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                    self._mark_write_send_done(req_id, decode_tp_size)
-                elif xfer_state == "PROC":
-                    in_progress.append((handle, decode_tp_size))
-                else:
-                    self._log_failure(
-                        failure_type="write_transfer_failed",
-                        req_id=req_id,
-                        xfer_state=xfer_state,
-                    )
-                    self.xfer_stats.record_failed_transfer()
-                    self.nixl_wrapper.release_xfer_handle(handle)
-                    self._mark_write_send_done(req_id, decode_tp_size)
-            if in_progress:
-                self._sending_write_transfers[req_id] = in_progress
-            else:
-                del self._sending_write_transfers[req_id]
+                    return True
+                if xfer_state == "PROC":
+                    time.sleep(0.0005)
+                    continue
+
+                self._log_failure(
+                    failure_type="write_transfer_failed",
+                    req_id=req_id,
+                    xfer_state=xfer_state,
+                )
+                self.xfer_stats.record_failed_transfer()
+                return True
+            return False
+        except Exception as e:
+            self._log_failure(
+                failure_type="write_transfer_wait_failed",
+                req_id=req_id,
+                error=e,
+            )
+            self.xfer_stats.record_failed_transfer()
+            return True
+        finally:
+            self.nixl_wrapper.release_xfer_handle(handle)
 
     def _send_write_done_notif(
         self, decode_engine_id: EngineId, decode_tp_rank: int, decode_req_id: ReqId
@@ -2189,13 +2238,13 @@ class NixlConnectorWorker:
         assert self.transfer_topo is not None
         tp_ratio = self.transfer_topo.tp_ratio(decode_tp_size)
         consumers_per_producer = -tp_ratio if decode_tp_size > self.world_size else 1
-        with self._done_sending_from_poller_lock:
+        with self._done_sending_from_background_lock:
             self.consumer_notification_counts_by_req[req_id] += 1
             if (
                 self.consumer_notification_counts_by_req[req_id]
                 == consumers_per_producer
             ):
-                self._done_sending_from_poller.add(req_id)
+                self._done_sending_from_background.add(req_id)
                 self.consumer_notification_counts_by_req.pop(req_id, None)
 
     def _handle_write_free_notif(self, notif: bytes) -> None:
@@ -2206,10 +2255,10 @@ class NixlConnectorWorker:
             return
         self._mark_write_send_done(req_id, int(tp_size))
 
-    def _drain_poller_done_sending(self) -> set[ReqId]:
-        with self._done_sending_from_poller_lock:
-            done = set(self._done_sending_from_poller)
-            self._done_sending_from_poller.clear()
+    def _drain_background_done_sending(self) -> set[ReqId]:
+        with self._done_sending_from_background_lock:
+            done = set(self._done_sending_from_background)
+            self._done_sending_from_background.clear()
             for req_id in done:
                 self.consumer_notification_counts_by_req.pop(req_id, None)
         for req_id in done:
@@ -2218,7 +2267,10 @@ class NixlConnectorWorker:
         return done
 
     def _drain_write_done_notifs(self) -> set[ReqId]:
-        done_recving: set[ReqId] = set(self._write_full_hit_reqs)
+        with self._done_recving_from_background_lock:
+            done_recving: set[ReqId] = set(self._done_recving_from_background)
+            self._done_recving_from_background.clear()
+        done_recving.update(self._write_full_hit_reqs)
         self._write_full_hit_reqs.clear()
         for notifs in self.nixl_wrapper.get_new_notifs().values():
             for notif in notifs:
@@ -2335,15 +2387,17 @@ class NixlConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
+        self._write_req_poller_stop_event.set()
         if getattr(self, "_write_req_poller_t", None) is not None:
-            self._write_req_poller_stop_event.set()
             self._write_req_poller_t.join(timeout=1)
             self._write_req_poller_t = None
+        if getattr(self, "_write_sender_executor", None) is not None:
+            for _ in range(self.num_write_sender_workers):
+                self._write_req_queue.put(None)
+            self._write_sender_executor.shutdown(wait=True)
+            self._write_sender_executor = None
+            self._write_sender_futures.clear()
         self._handshake_initiation_executor.shutdown(wait=False)
-        for handles in self._sending_write_transfers.values():
-            for handle, _ in handles:
-                self.nixl_wrapper.release_xfer_handle(handle)
-        self._sending_write_transfers.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()
