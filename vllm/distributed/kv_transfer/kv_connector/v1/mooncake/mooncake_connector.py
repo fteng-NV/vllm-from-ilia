@@ -1107,6 +1107,9 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
+            remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+            ready_req_ids = [d_req_id for d_req_id, _ in ready_reqs]
+            prepare_start = time.perf_counter()
             (
                 src_ptrs,
                 dst_ptrs,
@@ -1119,6 +1122,18 @@ class MooncakeConnectorWorker:
                 local_regions,
                 remote_regions,
             )
+            total_bytes = sum(lengths)
+            logger.info(
+                "Mooncake perf transfer_prepare reqs=%s remote=%s ready=%d "
+                "descs=%d bytes=%d prepare_ms=%.3f err_reqs=%s",
+                ready_req_ids,
+                remote_session,
+                len(ready_reqs),
+                len(src_ptrs),
+                total_bytes,
+                (time.perf_counter() - prepare_start) * 1000,
+                err_reqs or None,
+            )
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
                 (d_req_id, send_meta)
@@ -1127,7 +1142,7 @@ class MooncakeConnectorWorker:
             ]
 
             if src_ptrs:
-                remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
+                dispatch_start = time.perf_counter()
                 ret_value = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
@@ -1135,6 +1150,16 @@ class MooncakeConnectorWorker:
                     src_ptrs,
                     dst_ptrs,
                     lengths,
+                )
+                logger.info(
+                    "Mooncake perf transfer_dispatch reqs=%s remote=%s "
+                    "descs=%d bytes=%d dispatch_plus_xfer_ms=%.3f ret=%s",
+                    ready_req_ids,
+                    remote_session,
+                    len(src_ptrs),
+                    total_bytes,
+                    (time.perf_counter() - dispatch_start) * 1000,
+                    ret_value,
                 )
 
                 if ret_value != 0:
@@ -1361,15 +1386,25 @@ class MooncakeConnectorWorker:
         dst_ptrs: list[int],
         lengths: list[int],
     ) -> int:
+        total_bytes = sum(lengths)
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
         )
         duration = time.perf_counter() - start_time
+        logger.info(
+            "Mooncake perf batch_transfer_sync_write remote=%s descs=%d "
+            "bytes=%d xfer_ms=%.3f ret=%s",
+            remote_session,
+            len(src_ptrs),
+            total_bytes,
+            duration * 1000,
+            ret_value,
+        )
         if ret_value == 0:
             self.xfer_stats.record_transfer(
                 duration_s=duration,
-                total_bytes=sum(lengths),
+                total_bytes=total_bytes,
                 num_descs=len(src_ptrs),
             )
             logger.debug("Sending to %s done, took %s", remote_session, duration)
@@ -1381,7 +1416,7 @@ class MooncakeConnectorWorker:
                 ret_value,
                 duration,
                 len(src_ptrs),
-                sum(lengths),
+                total_bytes,
             )
         return ret_value
 
@@ -1558,6 +1593,7 @@ class MooncakeConnectorWorker:
         )
 
         # Send query for the request.
+        request_start = time.perf_counter()
         try:
             with make_zmq_socket(
                 self.async_zmq_ctx, worker_addr, zmq.DEALER, bind=False, linger=0
@@ -1566,7 +1602,16 @@ class MooncakeConnectorWorker:
                 sock.setsockopt(
                     zmq.RCVTIMEO, (envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT + 60) * 1000
                 )
+                send_start = time.perf_counter()
                 await sock.send(encoded_data)
+                logger.info(
+                    "Mooncake perf recv_request_send reqs=%s worker=%s "
+                    "bytes=%d send_ms=%.3f",
+                    sorted(req_ids),
+                    worker_addr,
+                    len(encoded_data),
+                    (time.perf_counter() - send_start) * 1000,
+                )
                 while True:
                     ret_msg = await sock.recv()
                     response = self._xfer_resp_decoder.decode(ret_msg)
@@ -1576,15 +1621,35 @@ class MooncakeConnectorWorker:
                             req_ids,
                             response.err_msg,
                         )
+                        logger.info(
+                            "Mooncake perf recv_request_failed reqs=%s "
+                            "worker=%s total_ms=%.3f",
+                            sorted(req_ids),
+                            worker_addr,
+                            (time.perf_counter() - request_start) * 1000,
+                        )
                         self.xfer_stats.record_failed_recv()
                         return
                     self.process_pulling_result(response, pull_metas)
                     if response.status == MooncakeXferResponseStatus.FINISH:
+                        logger.info(
+                            "Mooncake perf recv_request_done reqs=%s worker=%s "
+                            "total_ms=%.3f",
+                            sorted(req_ids),
+                            worker_addr,
+                            (time.perf_counter() - request_start) * 1000,
+                        )
                         break
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake receiver thread.")
         except Exception as e:
             logger.error("MooncakeXferMetadata transfer failed for %s: %s", req_ids, e)
+            logger.info(
+                "Mooncake perf recv_request_failed reqs=%s worker=%s total_ms=%.3f",
+                sorted(req_ids),
+                worker_addr,
+                (time.perf_counter() - request_start) * 1000,
+            )
             self.xfer_stats.record_failed_recv()
             return
 
