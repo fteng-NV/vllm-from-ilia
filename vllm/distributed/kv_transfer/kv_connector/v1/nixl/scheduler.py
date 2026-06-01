@@ -469,8 +469,8 @@ class NixlConnectorScheduler:
                     )
                 ):
                     # If remote_blocks and num_external_tokens = 0, we have
-                    # a full prefix cache hit on the local node. We need to call
-                    # send_notif in _read_blocks to free the memory on the remote node.
+                    # a full prefix cache hit on the local node. Notify the
+                    # remote side so it can free the pinned blocks.
 
                     unhashed_local_block_ids: BlockIds = (
                         blocks.get_unhashed_block_ids_all_groups()
@@ -481,8 +481,8 @@ class NixlConnectorScheduler:
                         unhashed_local_block_ids
                     )
 
-                    # Get unhashed blocks to pull from remote. Mind that a full prefix
-                    # cache hit is indicated with an empty list.
+                    # Get unhashed blocks to receive from remote. Mind that a full
+                    # prefix cache hit is indicated with an empty list.
                     self._reqs_need_recv[request.request_id] = (
                         request,
                         local_block_ids,
@@ -638,7 +638,7 @@ class NixlConnectorScheduler:
         delay_free_blocks = any(len(group) > 0 for group in block_ids)
         remote_num_tokens = 0
         if delay_free_blocks:
-            # Prefill request on remote. It will be read from D upon completion
+            # Prefill request on remote. It will be written to D upon completion.
             request_kv_blocks_ttl = self._kv_lease_duration
             if is_d_node:
                 # For blocks pinned on D, use a simpler timeout for now instead of a

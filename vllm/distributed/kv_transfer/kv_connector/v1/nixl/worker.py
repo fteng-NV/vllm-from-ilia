@@ -32,6 +32,8 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
     GET_META_MSG,
+    WRITE_DONE_MSG_PREFIX,
+    WRITE_REQ_MSG_PREFIX,
     NixlAgentMetadata,
     NixlConnectorMetadata,
     NixlHandshakePayload,
@@ -44,7 +46,6 @@ from vllm.distributed.kv_transfer.kv_connector.v1.nixl.stats import (
     NixlKVConnectorStats,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.tp_mapping import (
-    ReadSpec,
     TPMapping,
     _is_attention_spec,
     _is_ssm_spec,
@@ -379,10 +380,8 @@ class NixlConnectorWorker:
         self.dst_num_blocks: dict[EngineId, int] = {}
         self._registered_descs: list[Any] = []
 
-        # In progress transfers.
-        # [req_id -> list[handle]]
+        # In progress / pending transfers.
         self._recving_metadata: dict[ReqId, ReqMeta] = {}
-        self._recving_transfers = defaultdict[ReqId, list[TransferHandle]](list)
         # Track the expiration time of requests that are waiting to be sent.
         self._reqs_to_send: dict[ReqId, float] = {}
         # Set of requests that have been part of a batch, regardless of status.
@@ -431,7 +430,7 @@ class NixlConnectorWorker:
         self.transfer_topo: TransferTopology | None = None
 
         # With heterogeneous TP, P must wait for all assigned D TP workers to
-        # finish reading before safely freeing the blocks.
+        # finish receiving before safely freeing the blocks.
         self.consumer_notification_counts_by_req = defaultdict[ReqId, int](int)
         self.xfer_stats = NixlKVConnectorStats()
 
@@ -450,6 +449,14 @@ class NixlConnectorWorker:
         self.enforce_compat_hash = self.kv_transfer_config.get_from_extra_config(
             "enforce_handshake_compat", True
         )
+        self._sending_write_transfers = defaultdict[
+            ReqId, list[tuple[TransferHandle, int]]
+        ](list)
+        self._done_sending_from_poller: set[ReqId] = set()
+        self._done_sending_from_poller_lock = threading.Lock()
+        self._write_req_poller_stop_event = threading.Event()
+        self._write_req_poller_t: threading.Thread | None = None
+        self._write_full_hit_reqs: set[ReqId] = set()
 
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
@@ -517,77 +524,62 @@ class NixlConnectorWorker:
                 sock.send(msg)
                 handshake_bytes = sock.recv()
 
-                # Decode handshake payload to get compatibility hash
-                handshake_decoder = msgspec.msgpack.Decoder(NixlHandshakePayload)
-                try:
-                    handshake_payload = handshake_decoder.decode(handshake_bytes)
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    raise RuntimeError(
-                        f"Failed to decode NixlHandshakePayload. This likely indicates "
-                        f"an incompatibility between connector version. Error: {e}"
-                    ) from e
-
                 got_metadata_time = time.perf_counter()
                 logger.debug(
                     "NIXL handshake: get metadata took: %s",
                     got_metadata_time - start_time,
                 )
 
-                # Check compatibility hash BEFORE decoding agent metadata
-                assert self.compat_hash is not None
-                if (
-                    self.enforce_compat_hash
-                    and handshake_payload.compatibility_hash != self.compat_hash
-                ):
-                    raise RuntimeError(
-                        f"NIXL compatibility hash mismatch. "
-                        f"Local: {self.compat_hash}, "
-                        f"Remote: {handshake_payload.compatibility_hash}. "
-                        f"Prefill and decode instances have incompatible "
-                        f"configurations. This may be due to: different vLLM versions,"
-                        f" models, dtypes, KV cache layouts, attention backends, etc. "
-                        f"Both instances must use identical configurations."
-                        f"Disable this check using "
-                        f'--kv-transfer-config \'{{"kv_connector_extra_config": '
-                        f'{{"enforce_handshake_compat": false}}}}\''
-                    )
-
-                logger.info(
-                    "NIXL compatibility check passed (hash: %s)",
-                    handshake_payload.compatibility_hash,
+                remote_agent_name = self._register_remote_from_handshake_bytes(
+                    handshake_bytes, remote_rank, remote_tp_size, expected_engine_id
                 )
-
-                # Decode agent metadata
-                metadata_decoder = msgspec.msgpack.Decoder(NixlAgentMetadata)
-                try:
-                    metadata = metadata_decoder.decode(
-                        handshake_payload.agent_metadata_bytes
-                    )
-                except (msgspec.DecodeError, msgspec.ValidationError) as e:
-                    # This should not happen if hash matched
-                    raise RuntimeError(
-                        f"Failed to decode NixlAgentMetadata. Error: {e}"
-                    ) from e
-
-                # Ensure engine id matches.
-                if metadata.engine_id != expected_engine_id:
-                    raise RuntimeError(
-                        f"Remote NIXL agent engine ID mismatch. "
-                        f"Expected {expected_engine_id},"
-                        f"received {metadata.engine_id}."
-                    )
-
-                # Register Remote agent.
-                remote_agent_name = self.add_remote_agent(
-                    metadata, remote_rank, remote_tp_size
-                )
-                setup_agent_time = time.perf_counter()
                 logger.debug(
                     "NIXL handshake: add agent took: %s",
-                    setup_agent_time - got_metadata_time,
+                    time.perf_counter() - got_metadata_time,
                 )
                 remote_rank_to_agent_name[remote_rank] = remote_agent_name
         return remote_rank_to_agent_name
+
+    def _register_remote_from_handshake_bytes(
+        self,
+        handshake_bytes: bytes,
+        remote_rank: int,
+        remote_tp_size: int,
+        expected_engine_id: str,
+    ) -> str:
+        try:
+            handshake_payload = msgspec.msgpack.Decoder(NixlHandshakePayload).decode(
+                handshake_bytes
+            )
+        except (msgspec.DecodeError, msgspec.ValidationError) as e:
+            raise RuntimeError(
+                "Failed to decode NixlHandshakePayload. "
+                f"This likely indicates an incompatible connector version: {e}"
+            ) from e
+
+        assert self.compat_hash is not None
+        if (
+            self.enforce_compat_hash
+            and handshake_payload.compatibility_hash != self.compat_hash
+        ):
+            raise RuntimeError(
+                f"NIXL compatibility hash mismatch. Local: {self.compat_hash}, "
+                f"Remote: {handshake_payload.compatibility_hash}."
+            )
+
+        try:
+            metadata = msgspec.msgpack.Decoder(NixlAgentMetadata).decode(
+                handshake_payload.agent_metadata_bytes
+            )
+        except (msgspec.DecodeError, msgspec.ValidationError) as e:
+            raise RuntimeError(f"Failed to decode NixlAgentMetadata: {e}") from e
+
+        if metadata.engine_id != expected_engine_id:
+            raise RuntimeError(
+                f"Remote NIXL agent engine ID mismatch. Expected "
+                f"{expected_engine_id}, received {metadata.engine_id}."
+            )
+        return self.add_remote_agent(metadata, remote_rank, remote_tp_size)
 
     def initialize_host_xfer_buffer(self, kv_caches: dict[str, torch.Tensor]) -> None:
         """
@@ -1011,6 +1003,17 @@ class NixlConnectorWorker:
             agent_metadata_bytes=encoder.encode(agent_metadata),
         )
 
+        if (
+            self.kv_transfer_config.is_kv_producer
+            and self._write_req_poller_t is None
+        ):
+            self._write_req_poller_t = threading.Thread(
+                target=self._poll_write_req_loop,
+                daemon=True,
+                name="nixl_write_req_poller",
+            )
+            self._write_req_poller_t.start()
+
     def _build_mamba_local(
         self,
         base_addresses: list[int],
@@ -1424,6 +1427,12 @@ class NixlConnectorWorker:
         remote_info = self.transfer_topo.get_engine_info(remote_engine_id)
         assert remote_info.remote_tp_size == remote_tp_size
 
+        if nixl_agent_meta.block_size != self.block_size:
+            raise RuntimeError(
+                "NIXL WRITE mode requires matching block sizes. "
+                f"Local: {self.block_size}, remote: {nixl_agent_meta.block_size}."
+            )
+
         tp_ratio = self.transfer_topo.tp_ratio(remote_tp_size)
         block_size_ratio = self.transfer_topo.block_size_ratio(
             nixl_agent_meta.block_size
@@ -1698,8 +1707,12 @@ class NixlConnectorWorker:
         to track which workers are done.
         """
         assert self.transfer_topo is not None
-        done_sending = self._get_new_notifs()
-        done_recving = self._pop_done_transfers(self._recving_transfers)
+        if self.kv_transfer_config.is_kv_producer:
+            done_sending = self._drain_poller_done_sending()
+            done_recving = set[ReqId]()
+        else:
+            done_sending = set[ReqId]()
+            done_recving = self._drain_write_done_notifs()
 
         # Drain queue of requests where handshake or transfer setup failed.
         failed_recv_reqs = set[ReqId]()
@@ -1775,7 +1788,8 @@ class NixlConnectorWorker:
             # Sorted dict, oldest requests are put first so we can exit early.
             if now < expires:
                 break
-            count = self.consumer_notification_counts_by_req.pop(req_id, 0)
+            with self._done_sending_from_poller_lock:
+                count = self.consumer_notification_counts_by_req.pop(req_id, 0)
             self.xfer_stats.record_kv_expired_req()
             logger.warning(
                 "Releasing expired KV blocks for request %s which were "
@@ -1788,61 +1802,6 @@ class NixlConnectorWorker:
             done_sending.add(req_id)
 
         return done_sending, done_recving
-
-    def _get_new_notifs(self) -> set[str]:
-        """
-        Get req_ids which got a remote xfer message. When multiple consumers
-        are reading from the same producer (heterogeneous TP scenario), wait
-        for all consumers to be done pulling.
-
-        Also handles heartbeat notifications ("HB:req1,req2,...") by
-        extending the lease on the referenced requests.
-        """
-        assert self.transfer_topo is not None
-        notified_req_ids: set[str] = set()
-        for notifs in self.nixl_wrapper.get_new_notifs().values():
-            for notif in notifs:
-                msg = notif.decode("utf-8")
-
-                # Handle heartbeat messages from D-side.
-                if msg.startswith("HB:"):
-                    self._handle_heartbeat(msg[3:])
-                    continue
-
-                req_id, tp_size = msg.rsplit(":", 1)
-                if (
-                    req_id not in self._reqs_to_send
-                    and req_id not in self._reqs_to_process
-                ):
-                    logger.error(
-                        "Potentially invalid KV blocks for "
-                        "unrecognized request %s were retrieved by "
-                        "a decode worker. They may have expired.",
-                        req_id,
-                    )
-                    continue
-
-                # NOTE: `tp_ratio` is the opposite when swapping local<>remote
-                n_consumers = int(tp_size)
-                tp_ratio = self.transfer_topo.tp_ratio(n_consumers)
-
-                # Number of reads *per producer* to wait for.
-                # When remote D TP > local P TP we expect `tp_ratio` reads.
-                consumers_per_producer = (
-                    -tp_ratio if n_consumers > self.world_size else 1
-                )
-
-                self.consumer_notification_counts_by_req[req_id] += 1
-                # Wait all consumers (D) to be done reading before freeing.
-                if (
-                    self.consumer_notification_counts_by_req[req_id]
-                    == consumers_per_producer
-                ):
-                    notified_req_ids.add(req_id)
-                    del self.consumer_notification_counts_by_req[req_id]
-                    self._reqs_to_process.remove(req_id)
-                    self._reqs_to_send.pop(req_id, None)
-        return notified_req_ids
 
     def _handle_heartbeat(self, payload: str) -> None:
         """Extend leases for requests referenced in a heartbeat.
@@ -1864,53 +1823,6 @@ class NixlConnectorWorker:
                     old,
                     new_expiry,
                 )
-
-    def _pop_done_transfers(self, transfers: dict[str, list[int]]) -> set[str]:
-        """
-        Pop completed xfers by checking for DONE state.
-        Args:
-            transfers: dict of req_id -> list[running_xfer]
-        Returns:
-            set of req_ids that have all done xfers
-        """
-        done_req_ids: set[str] = set()
-        for req_id, handles in list(transfers.items()):
-            in_progress = []
-            for handle in handles:
-                try:
-                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
-                    if xfer_state == "DONE":
-                        # Get telemetry from NIXL
-                        res = self.nixl_wrapper.get_xfer_telemetry(handle)
-                        self.xfer_stats.record_transfer(res)
-                        self.nixl_wrapper.release_xfer_handle(handle)
-                    elif xfer_state == "PROC":
-                        in_progress.append(handle)
-                        continue
-                    else:
-                        self._log_failure(
-                            failure_type="transfer_failed",
-                            msg="Marking blocks as invalid",
-                            req_id=req_id,
-                            xfer_state=xfer_state,
-                        )
-                        self._handle_failed_transfer(req_id, handle)
-                except Exception as e:
-                    self._log_failure(
-                        failure_type="transfer_exception",
-                        msg="Marking blocks as invalid",
-                        req_id=req_id,
-                        error=e,
-                    )
-                    self._handle_failed_transfer(req_id, handle)
-
-            if not in_progress:
-                # Only report request as completed when all transfers are done.
-                done_req_ids.add(req_id)
-                del transfers[req_id]
-            else:
-                transfers[req_id] = in_progress
-        return done_req_ids
 
     def _handle_failed_transfer(self, req_id: str, handle: int | None):
         """
@@ -1940,8 +1852,6 @@ class NixlConnectorWorker:
                 meta.local_block_ids
             )
             assert meta.remote is not None
-            # Remote block IDs are kept logical here; expanded in
-            # _read_blocks_for_req using the remote engine's phys ratio.
             remote_engine_id = meta.remote.engine_id
             logger.debug(
                 "start_load_kv for request %s from remote engine %s. "
@@ -1960,19 +1870,19 @@ class NixlConnectorWorker:
                         self._background_nixl_handshake(req_id, remote_engine_id, meta)
                         continue
 
-            # Handshake already completed, start async read xfer.
-            self._read_blocks_for_req(req_id, meta)
+            self._request_remote_write_for_req(req_id, meta)
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
-            self._read_blocks_for_req(*self._ready_requests.get_nowait())
+            ready_req_id, ready_meta = self._ready_requests.get_nowait()
+            self._request_remote_write_for_req(ready_req_id, ready_meta)
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
         # moment in which requests expiration is set (P side) and the moment in
-        # which blocks are read from D. As P can now more easily lag behind D
+        # which blocks are received by D. As P can now more easily lag behind D
         # while processing the next batch, we make sure to only set an
-        # expiration for requests that have not been read from D yet.
+        # expiration for requests that have not been received by D yet.
         for req_id in metadata.reqs_in_batch:
             self._reqs_to_process.add(req_id)
 
@@ -2018,251 +1928,311 @@ class NixlConnectorWorker:
                         exc_info=True,
                     )
 
-    def _read_blocks_for_req(self, req_id: str, meta: ReqMeta):
+    def _request_remote_write_for_req(self, req_id: ReqId, meta: ReqMeta) -> None:
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         plan = self.tp_mappings[engine_id]
-        remote_info = self.transfer_topo.get_engine_info(engine_id)
-        tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
-
-        meta.remote.block_ids = self._logical_to_remote_kernel_block_ids(
-            meta.remote.block_ids,
-            remote_info.remote_physical_blocks_per_logical,
-        )
-        remote_block_ids = meta.remote.block_ids
         local_block_ids = meta.local_physical_block_ids
-        num_groups = len(local_block_ids)
-        read_specs = [
-            ReadSpec(
-                remote_rank=rank,
-                local_block_ids=[
-                    list(local_block_ids[g])
-                    if rank in plan.source_ranks_per_group[g]
-                    else []
-                    for g in range(num_groups)
-                ],
-                remote_block_ids=[
-                    list(remote_block_ids[g])
-                    if rank in plan.source_ranks_per_group[g]
-                    else []
-                    for g in range(num_groups)
-                ],
-            )
-            for rank in plan.all_source_ranks
-        ]
 
-        # D may have to perform multiple reads from different remote ranks.
-        # MLA opt: when P TP > D TP, only a single read is executed for
-        # the first remote rank (cache is duplicated)..
-        if self.use_mla and tp_ratio < 0:
-            assert len(read_specs) == 1
-
-        for i, spec in enumerate(read_specs):
-            remote_block_size = remote_info.remote_block_size
-            logger.debug(
-                "Remote agent %s available, calling _read_blocks"
-                " on remote rank %s with remote block size %s for req %s",
-                meta.remote.engine_id,
-                spec.remote_rank,
-                remote_block_size,
-                req_id,
-            )
-            # Get side handles.
-            if tp_ratio < 0 and not self.use_mla:
-                assert remote_block_size == self.block_size
-                # Remote tp_size > local tp_size: we must perform multiple
-                # reads. Get the memory chunk onto which we will write to.
-                local_xfer_side_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][i]
-            else:
-                # Single read from remote, we write to the whole memory region.
-                # Also handle remote block size different from local block size.
-                local_xfer_side_handle = self.src_xfer_handles_by_block_size[
-                    remote_block_size
-                ]
-
-            # Destination handle: remote_engine_id -> remote_rank -> handle.
-            remote_xfer_side_handle = self.dst_xfer_side_handles[meta.remote.engine_id][
-                spec.remote_rank
-            ]
-
-            self._read_blocks(
-                read_spec=spec,
-                request_id=req_id,
-                dst_engine_id=meta.remote.engine_id,
-                remote_request_id=meta.remote.request_id,
-                local_xfer_side_handle=local_xfer_side_handle,
-                remote_xfer_side_handle=remote_xfer_side_handle,
-            )
-
-        if self.use_mla and tp_ratio < 0 and read_specs:
-            # ..but we still need to notify the other remote ranks that we
-            # have the blocks we need so they can update the request state.
+        if all(len(g) == 0 for g in local_block_ids):
             notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
-            remote_agents = self._remote_agents[meta.remote.engine_id]
-            for rank_to_notify, agent in remote_agents.items():
-                if rank_to_notify != read_specs[0].remote_rank:
-                    self.nixl_wrapper.send_notif(agent, notif_msg=notif_id)
-
-    def _read_blocks(
-        self,
-        read_spec: ReadSpec,
-        dst_engine_id: str,
-        request_id: str,
-        remote_request_id: str,
-        local_xfer_side_handle: int,
-        remote_xfer_side_handle: int,
-    ):
-        """
-        Post a READ point-to-point xfer request from a single local worker to
-        a single remote worker.
-        """
-        assert self.transfer_topo is not None
-        remote_rank = read_spec.remote_rank
-        local_block_ids = read_spec.local_block_ids
-        remote_block_ids = read_spec.remote_block_ids
-
-        remote_info = self.transfer_topo.get_engine_info(dst_engine_id)
-        block_size_ratio = self.transfer_topo.block_size_ratio(
-            remote_info.remote_block_size
-        )
-        if block_size_ratio > 1:
-            # TODO (NickLucche) assume HMA is off. Change to handle multiple KV groups.
-            assert not self._is_hma_required
-            local_block_ids0 = local_block_ids[0] if local_block_ids else []
-            remote_block_ids0 = remote_block_ids[0]
-            local_block_ids_mapped = self.get_mapped_blocks(
-                np.asarray(local_block_ids0), block_size_ratio
-            ).tolist()
-            if len(local_block_ids_mapped) > len(remote_block_ids0):
-                # NOTE:
-                # get_mapped_blocks will always expand block_ids for n times.
-                # ex:
-                # prefill block_ids with block_size as 4:
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-                # Local decode block_ids with block_size as 16: [1, 2, 3]
-                # expanded decode block_ids with get_mapped_blocks from [1, 2, 3] to
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
-                # Then we clip local to align with prefill
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] to
-                # [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
-                local_block_ids_mapped = local_block_ids_mapped[
-                    : len(remote_block_ids0)
-                ]
-            local_block_ids = [local_block_ids_mapped] if local_block_ids_mapped else []
-            remote_block_ids = [remote_block_ids0]
-        # NOTE(rob): having the staging blocks be on the READER side is
-        # not going to work well (since we will have to call rearrange tensors).
-        # after we detect the txn is complete (which means we cannot make the
-        # read trxn async easily). If we want to make "READ" happen cleanly,
-        # then we will need to have the staging blocks on the remote side.
-
-        # NOTE(rob): according to nvidia the staging blocks are used to
-        # saturate IB with heterogeneous TP sizes.
-
-        # Number of D TP workers that will read from dst P. Propagate info
-        # on notification so that dst worker can wait before freeing blocks.
-        notif_id = f"{remote_request_id}:{self.world_size}".encode()
-
-        # Full prefix cache hit: do not need to read remote blocks,
-        # just notify P worker that we have the blocks we need.
-        if len(local_block_ids) == 0:
-            # A full prefix cache hit is indicated with an empty list.
-            agent_name = self._remote_agents[dst_engine_id][remote_rank]
-            try:
-                self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
-            except Exception as e:
-                self._log_failure(
-                    failure_type="notification_failed",
-                    msg="P worker blocks will be freed after timeout. "
-                    "This may indicate network issues.",
-                    req_id=request_id,
-                    error=e,
-                    dst_engine_id=dst_engine_id,
-                    remote_rank=remote_rank,
-                    remote_agent_name=agent_name,
-                )
-                self.xfer_stats.record_failed_notification()
+            for remote_rank in plan.all_source_ranks:
+                agent_name = self._remote_agents[engine_id][remote_rank]
+                try:
+                    self.nixl_wrapper.send_notif(agent_name, notif_msg=notif_id)
+                except Exception as e:
+                    self._log_failure(
+                        failure_type="write_free_notif_failed",
+                        req_id=req_id,
+                        error=e,
+                        dst_engine_id=engine_id,
+                        remote_rank=remote_rank,
+                    )
+                    self.xfer_stats.record_failed_notification()
+            self._write_full_hit_reqs.add(req_id)
             return
 
-        assert (
-            len(remote_block_ids)
-            == len(local_block_ids)
-            == len(self.kv_cache_config.kv_cache_groups)
-        )
-        remote_physical_per_logical = remote_info.remote_physical_blocks_per_logical
-        local_block_ids, remote_block_ids = self._apply_prefix_caching(
-            local_block_ids, remote_block_ids, remote_physical_per_logical
-        )
+        assert self.xfer_handshake_metadata is not None
+        payload = {
+            "decode_req_id": req_id,
+            "decode_engine_id": self.engine_id,
+            "decode_handshake": msgspec.msgpack.encode(self.xfer_handshake_metadata),
+            "decode_tp_size": self.world_size,
+            "decode_tp_rank": self.tp_rank,
+            "decode_block_ids": [list(g) for g in local_block_ids],
+            "prefill_req_id": meta.remote.request_id,
+            "prefill_block_ids": [list(g) for g in meta.remote.block_ids],
+        }
+        encoded = WRITE_REQ_MSG_PREFIX + msgspec.msgpack.encode(payload)
+        for remote_rank in plan.all_source_ranks:
+            agent_name = self._remote_agents[engine_id][remote_rank]
+            try:
+                self.nixl_wrapper.send_notif(agent_name, notif_msg=encoded)
+            except Exception as e:
+                self._log_failure(
+                    failure_type="write_request_failed",
+                    req_id=req_id,
+                    error=e,
+                    dst_engine_id=engine_id,
+                    remote_rank=remote_rank,
+                )
+                self._handle_failed_transfer(req_id, None)
 
-        # NOTE (nicolo) With homogeneous TP, each TP worker loads KV from
-        # corresponding rank. With heterogeneous TP, fixing D>P, the D tp
-        # workers will issue xfers to parts of the P worker remote kv caches.
+    def _poll_write_req_loop(self) -> None:
+        if not self.use_host_buffer:
+            current_platform.set_device(self.device_id)
 
-        # Get descs ids.
-        remote_block_descs_ids = self._compute_desc_ids(
-            block_ids=remote_block_ids,
-            dst_num_blocks=self.dst_num_blocks[dst_engine_id],
+        while not self._write_req_poller_stop_event.is_set():
+            try:
+                had_work = False
+                for notifs in self.nixl_wrapper.get_new_notifs().values():
+                    for notif in notifs:
+                        had_work = True
+                        if notif.startswith(WRITE_REQ_MSG_PREFIX):
+                            payload = msgspec.msgpack.decode(
+                                notif[len(WRITE_REQ_MSG_PREFIX) :]
+                            )
+                            self._handle_write_req(payload)
+                        elif notif.startswith(WRITE_DONE_MSG_PREFIX):
+                            logger.warning(
+                                "Unexpected write_done on producer rank %s",
+                                self.tp_rank,
+                            )
+                        else:
+                            msg = notif.decode("utf-8")
+                            if msg.startswith("HB:"):
+                                self._handle_heartbeat(msg[3:])
+                            else:
+                                self._handle_write_free_notif(notif)
+
+                self._pop_done_write_transfers()
+
+                if not had_work:
+                    time.sleep(0.001)
+            except Exception:
+                logger.exception("NIXL WRITE poller exception")
+                time.sleep(0.01)
+
+    def _handle_write_req(self, payload: dict[str, Any]) -> None:
+        decode_engine_id = payload["decode_engine_id"]
+        decode_tp_size = int(payload["decode_tp_size"])
+        decode_tp_rank = int(payload["decode_tp_rank"])
+        prefill_req_id = payload["prefill_req_id"]
+
+        try:
+            if decode_tp_rank not in self._remote_agents.get(decode_engine_id, {}):
+                with self._handshake_lock:
+                    if decode_tp_rank not in self._remote_agents.get(
+                        decode_engine_id, {}
+                    ):
+                        agent_name = self._register_remote_from_handshake_bytes(
+                            payload["decode_handshake"],
+                            decode_tp_rank,
+                            decode_tp_size,
+                            decode_engine_id,
+                        )
+                        self._remote_agents[decode_engine_id][decode_tp_rank] = (
+                            agent_name
+                        )
+
+            posted = self._write_blocks(
+                prefill_req_id=prefill_req_id,
+                decode_req_id=payload["decode_req_id"],
+                decode_engine_id=decode_engine_id,
+                decode_tp_rank=decode_tp_rank,
+                decode_tp_size=decode_tp_size,
+                prefill_block_ids=[list(g) for g in payload["prefill_block_ids"]],
+                decode_block_ids=[list(g) for g in payload["decode_block_ids"]],
+            )
+            if not posted:
+                self._mark_write_send_done(prefill_req_id, decode_tp_size)
+        except Exception as e:
+            self._log_failure(
+                failure_type="write_request_processing_failed",
+                req_id=prefill_req_id,
+                error=e,
+                dst_engine_id=decode_engine_id,
+                decode_tp_rank=decode_tp_rank,
+            )
+            self.xfer_stats.record_failed_transfer()
+            self._mark_write_send_done(prefill_req_id, decode_tp_size)
+
+    def _write_blocks(
+        self,
+        prefill_req_id: ReqId,
+        decode_req_id: ReqId,
+        decode_engine_id: EngineId,
+        decode_tp_rank: int,
+        decode_tp_size: int,
+        prefill_block_ids: BlockIds,
+        decode_block_ids: BlockIds,
+    ) -> bool:
+        assert self.transfer_topo is not None
+        remote_info = self.transfer_topo.get_engine_info(decode_engine_id)
+        tp_ratio = self.transfer_topo.tp_ratio(remote_info.remote_tp_size)
+        prefill_block_ids = self._logical_to_kernel_block_ids(prefill_block_ids)
+
+        src_groups: list[list[int]] = []
+        dst_groups: list[list[int]] = []
+        for p_group, d_group in zip(prefill_block_ids, decode_block_ids):
+            n = min(len(p_group), len(d_group))
+            src_groups.append(list(p_group[-n:]) if n else [])
+            dst_groups.append(list(d_group[-n:]) if n else [])
+
+        if all(len(g) == 0 for g in dst_groups):
+            self._send_write_done_notif(decode_engine_id, decode_tp_rank, decode_req_id)
+            return False
+
+        src_desc_ids = self._compute_desc_ids(
+            block_ids=src_groups,
+            dst_num_blocks=self.dst_num_blocks[self.engine_id],
+            block_size_ratio=None,
+            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
+        )
+        dst_desc_ids = self._compute_desc_ids(
+            block_ids=dst_groups,
+            dst_num_blocks=self.dst_num_blocks[decode_engine_id],
             block_size_ratio=None,
             physical_blocks_per_logical=remote_info.remote_physical_blocks_per_logical,
         )
-        local_block_descs_ids = self._compute_desc_ids(
-            block_ids=local_block_ids,
-            dst_num_blocks=self.dst_num_blocks[self.engine_id],
-            block_size_ratio=block_size_ratio,
-            physical_blocks_per_logical=self._physical_blocks_per_logical_kv_block,
-        )
+        assert len(src_desc_ids) == len(dst_desc_ids)
 
-        assert len(local_block_descs_ids) == len(remote_block_descs_ids)
-
-        # Prepare transfer with Nixl.
+        if tp_ratio < 0 and not self.use_mla:
+            plan = self.tp_mappings[decode_engine_id]
+            split_idx = plan.all_source_ranks.index(decode_tp_rank)
+            local_handle = self.src_xfer_handles_by_tp_ratio[tp_ratio][split_idx]
+        else:
+            local_handle = self.src_xfer_handles_by_block_size[self.block_size]
+        remote_handle = self.dst_xfer_side_handles[decode_engine_id][decode_tp_rank]
         handle = None
         try:
             handle = self.nixl_wrapper.make_prepped_xfer(
-                "READ",
-                local_xfer_side_handle,
-                local_block_descs_ids,
-                remote_xfer_side_handle,
-                remote_block_descs_ids,
-                notif_msg=notif_id,
+                "WRITE",
+                local_handle,
+                src_desc_ids,
+                remote_handle,
+                dst_desc_ids,
+                notif_msg=WRITE_DONE_MSG_PREFIX + decode_req_id.encode("utf-8"),
             )
-
-            # Begin async xfer.
             self.nixl_wrapper.transfer(handle)
-
-            # Use handle to check completion in future step().
-            self._recving_transfers[request_id].append(handle)
-        except Exception as e:
-            # mark all (logical) blocks for this request as invalid
-            self._log_failure(
-                failure_type="transfer_setup_failed",
-                req_id=request_id,
-                msg="Marking blocks as invalid",
-                error=e,
-                dst_engine_id=dst_engine_id,
-                remote_rank=remote_rank,
+            self._sending_write_transfers[prefill_req_id].append(
+                (handle, decode_tp_size)
             )
-            self._handle_failed_transfer(request_id, handle)
+            return True
+        except Exception as e:
+            self._log_failure(
+                failure_type="write_transfer_setup_failed",
+                req_id=prefill_req_id,
+                error=e,
+                dst_engine_id=decode_engine_id,
+                decode_tp_rank=decode_tp_rank,
+            )
+            self.xfer_stats.record_failed_transfer()
+            if handle is not None:
+                self.nixl_wrapper.release_xfer_handle(handle)
+            self._mark_write_send_done(prefill_req_id, decode_tp_size)
+            return True
 
-    def get_mapped_blocks(
-        self, block_ids: np.ndarray, block_size_ratio: int
-    ) -> np.ndarray:
-        """
-          Calculates the new set of block IDs by mapping every element
-          in the (potentially sparse) input array.
-          Example: block_ids=[0, 2], block_size_ratio=2
-        get_mapped_blocks    0     1     [2     3]     4     5
-              # remote is |h0-b0|h1-b0||h0-b1|h1-b1||h0-b1|h1-b1||
-              # local is  |h0-b0......||h1-b0......||h2-b0........
-        local_block_ids         0           [1]           2
-        """
-        if block_ids.size == 0:
-            return np.array([], dtype=np.int64)
+    def _pop_done_write_transfers(self) -> None:
+        for req_id, handles in list(self._sending_write_transfers.items()):
+            in_progress: list[tuple[TransferHandle, int]] = []
+            for handle, decode_tp_size in handles:
+                try:
+                    xfer_state = self.nixl_wrapper.check_xfer_state(handle)
+                except Exception:
+                    logger.exception("Error checking WRITE state for req %s", req_id)
+                    self.xfer_stats.record_failed_transfer()
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                    self._mark_write_send_done(req_id, decode_tp_size)
+                    continue
+                if xfer_state == "DONE":
+                    res = self.nixl_wrapper.get_xfer_telemetry(handle)
+                    self.xfer_stats.record_transfer(res)
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                    self._mark_write_send_done(req_id, decode_tp_size)
+                elif xfer_state == "PROC":
+                    in_progress.append((handle, decode_tp_size))
+                else:
+                    self._log_failure(
+                        failure_type="write_transfer_failed",
+                        req_id=req_id,
+                        xfer_state=xfer_state,
+                    )
+                    self.xfer_stats.record_failed_transfer()
+                    self.nixl_wrapper.release_xfer_handle(handle)
+                    self._mark_write_send_done(req_id, decode_tp_size)
+            if in_progress:
+                self._sending_write_transfers[req_id] = in_progress
+            else:
+                del self._sending_write_transfers[req_id]
 
-        start_ids = block_ids * block_size_ratio
-        offsets = np.arange(block_size_ratio)
-        mapped_2d = start_ids[:, None] + offsets[None, :]
+    def _send_write_done_notif(
+        self, decode_engine_id: EngineId, decode_tp_rank: int, decode_req_id: ReqId
+    ) -> None:
+        agent_name = self._remote_agents[decode_engine_id][decode_tp_rank]
+        try:
+            self.nixl_wrapper.send_notif(
+                agent_name,
+                notif_msg=WRITE_DONE_MSG_PREFIX + decode_req_id.encode("utf-8"),
+            )
+        except Exception as e:
+            self._log_failure(
+                failure_type="write_done_notif_failed",
+                req_id=decode_req_id,
+                error=e,
+                dst_engine_id=decode_engine_id,
+                decode_tp_rank=decode_tp_rank,
+            )
+            self.xfer_stats.record_failed_notification()
 
-        return mapped_2d.flatten().astype(np.int64)
+    def _mark_write_send_done(self, req_id: ReqId, decode_tp_size: int) -> None:
+        assert self.transfer_topo is not None
+        tp_ratio = self.transfer_topo.tp_ratio(decode_tp_size)
+        consumers_per_producer = -tp_ratio if decode_tp_size > self.world_size else 1
+        with self._done_sending_from_poller_lock:
+            self.consumer_notification_counts_by_req[req_id] += 1
+            if (
+                self.consumer_notification_counts_by_req[req_id]
+                == consumers_per_producer
+            ):
+                self._done_sending_from_poller.add(req_id)
+                self.consumer_notification_counts_by_req.pop(req_id, None)
+
+    def _handle_write_free_notif(self, notif: bytes) -> None:
+        try:
+            req_id, tp_size = notif.decode("utf-8").rsplit(":", 1)
+        except Exception:
+            logger.warning("Malformed write-free notification %r", notif[:32])
+            return
+        self._mark_write_send_done(req_id, int(tp_size))
+
+    def _drain_poller_done_sending(self) -> set[ReqId]:
+        with self._done_sending_from_poller_lock:
+            done = set(self._done_sending_from_poller)
+            self._done_sending_from_poller.clear()
+            for req_id in done:
+                self.consumer_notification_counts_by_req.pop(req_id, None)
+        for req_id in done:
+            self._reqs_to_process.discard(req_id)
+            self._reqs_to_send.pop(req_id, None)
+        return done
+
+    def _drain_write_done_notifs(self) -> set[ReqId]:
+        done_recving: set[ReqId] = set(self._write_full_hit_reqs)
+        self._write_full_hit_reqs.clear()
+        for notifs in self.nixl_wrapper.get_new_notifs().values():
+            for notif in notifs:
+                if notif.startswith(WRITE_DONE_MSG_PREFIX):
+                    done_recving.add(
+                        notif[len(WRITE_DONE_MSG_PREFIX) :].decode("utf-8")
+                    )
+                else:
+                    logger.debug(
+                        "Ignoring non-write_done notif %r on rank %s",
+                        notif[:24],
+                        self.tp_rank,
+                    )
+        return done_recving
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
         """
@@ -2288,99 +2258,6 @@ class NixlConnectorWorker:
             else group
             for i, group in enumerate(block_ids)
         ]
-
-    def _apply_prefix_caching(
-        self,
-        local_block_ids: BlockIds,
-        remote_block_ids: BlockIds,
-        remote_physical_per_logical: int,
-    ) -> tuple[BlockIds, list]:
-        """Apply prefix caching by trimming local/remote block ID lists.
-
-        For non-Mamba models: end-trim remote to match local count, so that
-        already-cached prefix blocks are skipped in the transfer.
-
-        For Mamba hybrid (prefix caching not yet supported): front-trim both
-        to the minimum count to handle kernel block count discrepancies from
-        logical block rounding in heterogeneous TP.
-        """
-        # Partial prefix cache hit: just read uncomputed blocks.
-        # Skip mamba groups — their blocks represent full state (conv+ssm),
-        # not per-token data, so trimming would corrupt the transfer.
-        remote_block_ids = list(remote_block_ids)
-        if not self._has_mamba:
-            for i, remote_group in enumerate(remote_block_ids):
-                num_local_blocks = len(local_block_ids[i])
-                assert num_local_blocks <= len(remote_group)
-                if num_local_blocks < len(remote_group):
-                    remote_block_ids[i] = remote_group[-num_local_blocks:]
-        else:
-            # (NOTE: ZhanqiuHu) Mamba hybrid: no prefix caching support so far.HeteroTP
-            # can cause different kernel block counts due to logical block rounding.
-            # Example: 640 prompt tokens, kernel_block_size=64
-            #   remote physical_per_logical=10, local physical_per_logical=6
-            #   remote logical ids from kv_transfer_params = [0]
-            #   local logical ids allocated = [0, 1]
-            #   remote kernel blocks: [0..9]  (1*10=10)
-            #   local kernel blocks:  [0..11] (2*6=12)
-            #   actual data blocks = ceil(640/64) = 10, trim both to 10
-            # Vice versa (remote physical_per_logical=6, local=10):
-            #   remote logical ids = [0, 1], local logical ids = [0]
-            #   remote kernel blocks: [0..11] (2*6=12)
-            #   local kernel blocks:  [0..9]  (1*10=10)
-            #   actual data blocks = ceil(640/64) = 10, trim both to 10
-            local_block_ids = list(local_block_ids)
-            for i, remote_group in enumerate(remote_block_ids):
-                num_local_blocks = len(local_block_ids[i])
-                num_remote_blocks = len(remote_group)
-                if _is_ssm_spec(self._group_spec_types[i]):
-                    assert num_local_blocks == num_remote_blocks
-                else:
-                    max_padding = max(
-                        self._physical_blocks_per_logical_kv_block,
-                        remote_physical_per_logical,
-                    )
-                    assert abs(num_local_blocks - num_remote_blocks) < max_padding, (
-                        f"Group {i}: |{num_local_blocks} - "
-                        f"{num_remote_blocks}| >= {max_padding}"
-                    )
-                    num_blocks = min(num_local_blocks, num_remote_blocks)
-                    local_block_ids[i] = local_block_ids[i][:num_blocks]
-                    remote_block_ids[i] = remote_group[:num_blocks]
-        return local_block_ids, remote_block_ids
-
-    def _logical_to_remote_kernel_block_ids(
-        self, block_ids: BlockIds, remote_physical_per_logical: int
-    ) -> BlockIds:
-        """Map logical block IDs to physical kernel block IDs on the remote.
-
-        Args:
-            block_ids: per-group lists of logical block IDs.
-            remote_physical_per_logical: remote engine's physical blocks
-                per logical block.
-
-        Returns:
-            Same structure with FA groups expanded (each logical block L
-            becomes kernel blocks [L*remote_physical_per_logical, ..
-            L*remote_physical_per_logical +
-            remote_physical_per_logical - 1]).
-            Mamba groups are passed through unchanged.
-        """
-        if remote_physical_per_logical == 1:
-            return block_ids
-        remote_arange = np.arange(remote_physical_per_logical).reshape(1, -1)
-        group_specs = self.kv_cache_config.kv_cache_groups
-        result = [
-            BlockTable.map_to_kernel_blocks(
-                np.array(group),
-                remote_physical_per_logical,
-                remote_arange,
-            ).tolist()
-            if not isinstance(group_specs[i].kv_cache_spec, MambaSpec)
-            else group
-            for i, group in enumerate(block_ids)
-        ]
-        return result
 
     def get_backend_aware_kv_block_len(
         self, layer_idx: int, first_split: bool = True, mamba_view: bool = False
@@ -2458,11 +2335,15 @@ class NixlConnectorWorker:
         if not hasattr(self, "_handshake_initiation_executor"):
             # error happens during init, no need to shutdown
             return
+        if getattr(self, "_write_req_poller_t", None) is not None:
+            self._write_req_poller_stop_event.set()
+            self._write_req_poller_t.join(timeout=1)
+            self._write_req_poller_t = None
         self._handshake_initiation_executor.shutdown(wait=False)
-        for handles in self._recving_transfers.values():
-            for handle in handles:
+        for handles in self._sending_write_transfers.values():
+            for handle, _ in handles:
                 self.nixl_wrapper.release_xfer_handle(handle)
-        self._recving_transfers.clear()
+        self._sending_write_transfers.clear()
         for handle in self.src_xfer_handles_by_block_size.values():
             self.nixl_wrapper.release_dlist_handle(handle)
         self.src_xfer_handles_by_block_size.clear()

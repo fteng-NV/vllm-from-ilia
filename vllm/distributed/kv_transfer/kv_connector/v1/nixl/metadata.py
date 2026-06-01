@@ -19,6 +19,8 @@ TransferHandle = int
 ReqId = str
 
 GET_META_MSG = b"get_meta_msg"
+WRITE_REQ_MSG_PREFIX = b"write_req:"
+WRITE_DONE_MSG_PREFIX = b"write_done:"
 #
 # NIXL Connector Version
 #
