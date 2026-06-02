@@ -36,8 +36,9 @@ WRITE_DONE_MSG_PREFIX = b"write_done:"
 #   2: Add remote_request_id to kv_transfer_params
 #   3: Add physical_blocks_per_logical_kv_block to NixlAgentMetadata
 #   4: Add KV block lease renewal through heartbeats
+#   5: Add batched WRITE completion notifications
 #
-NIXL_CONNECTOR_VERSION: int = 4
+NIXL_CONNECTOR_VERSION: int = 5
 
 
 @dataclass

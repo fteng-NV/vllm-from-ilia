@@ -580,6 +580,7 @@ class MooncakeConnectorScheduler:
             token_ids = request.prompt_token_ids or []
             count = len(token_ids) - num_computed_tokens
             if count > 0:
+                logger.info("KV TTFT arrival req=%s", request.request_id)
                 return count, True
 
         # No remote prefill for this request.

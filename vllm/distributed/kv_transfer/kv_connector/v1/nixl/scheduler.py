@@ -385,6 +385,7 @@ class NixlConnectorScheduler:
             actual = self._mamba_prefill_token_count(len(token_ids))
             count = actual - num_computed_tokens
             if count > 0:
+                logger.info("KV TTFT arrival req=%s", request.request_id)
                 return count, True
 
         if params is not None and params.get("do_remote_decode") and self._has_mamba:
