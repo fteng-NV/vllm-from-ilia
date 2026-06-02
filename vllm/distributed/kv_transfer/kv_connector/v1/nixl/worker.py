@@ -83,6 +83,7 @@ if TYPE_CHECKING:
 
 logger = init_logger(__name__)
 
+WRITE_REQ_BATCH_MSG_PREFIX = b"write_req_batch:"
 WRITE_DONE_BATCH_MSG_PREFIX = b"write_done_batch:"
 
 
@@ -476,7 +477,16 @@ class NixlConnectorWorker:
         )
         if self.write_batch_wait_s < 0:
             raise ValueError("NIXL write_batch_wait_ms must be non-negative")
-        self._write_req_queue: queue.Queue[dict[str, Any] | None] = queue.Queue()
+        self.write_req_batch_max_size = int(
+            self.kv_transfer_config.get_from_extra_config(
+                "write_req_batch_max_size", self.write_batch_max_size
+            )
+        )
+        if self.write_req_batch_max_size <= 0:
+            raise ValueError("NIXL write_req_batch_max_size must be positive")
+        self._write_req_queue: queue.Queue[
+            dict[str, Any] | list[dict[str, Any]] | None
+        ] = queue.Queue()
         self._write_sender_executor: ThreadPoolExecutor | None = None
         self._write_sender_futures: list[Future[None]] = []
         self._done_sending_from_background: set[ReqId] = set()
@@ -1890,6 +1900,7 @@ class NixlConnectorWorker:
         Start loading by triggering non-blocking nixl_xfer.
         We check for these trnxs to complete in each step().
         """
+        pending_write_reqs: list[tuple[ReqId, ReqMeta]] = []
         for req_id, meta in metadata.reqs_to_recv.items():
             meta.local_physical_block_ids = self._logical_to_kernel_block_ids(
                 meta.local_block_ids
@@ -1913,12 +1924,14 @@ class NixlConnectorWorker:
                         self._background_nixl_handshake(req_id, remote_engine_id, meta)
                         continue
 
-            self._request_remote_write_for_req(req_id, meta)
+            pending_write_reqs.append((req_id, meta))
 
         # Start transfers for requests whose handshakes have now finished.
         while not self._ready_requests.empty():
             ready_req_id, ready_meta = self._ready_requests.get_nowait()
-            self._request_remote_write_for_req(ready_req_id, ready_meta)
+            pending_write_reqs.append((ready_req_id, ready_meta))
+
+        self._request_remote_write_for_reqs(pending_write_reqs)
 
         # Keep around the requests that have been part of a batch. This is
         # needed because async scheduling pushes the misalignment between the
@@ -1971,6 +1984,120 @@ class NixlConnectorWorker:
                         exc_info=True,
                     )
 
+    def _build_write_req_payload(self, req_id: ReqId, meta: ReqMeta) -> dict[str, Any]:
+        assert self.xfer_handshake_metadata is not None
+        assert meta.remote is not None
+        local_block_ids = meta.local_physical_block_ids
+        return {
+            "decode_req_id": req_id,
+            "decode_engine_id": self.engine_id,
+            "decode_handshake": msgspec.msgpack.encode(
+                self.xfer_handshake_metadata
+            ),
+            "decode_tp_size": self.world_size,
+            "decode_tp_rank": self.tp_rank,
+            "decode_block_ids": [list(g) for g in local_block_ids],
+            "prefill_req_id": meta.remote.request_id,
+            "prefill_block_ids": [list(g) for g in meta.remote.block_ids],
+        }
+
+    def _request_remote_write_for_reqs(
+        self, reqs: list[tuple[ReqId, ReqMeta]]
+    ) -> None:
+        if not reqs:
+            return
+
+        if self.write_req_batch_max_size <= 1:
+            for req_id, meta in reqs:
+                self._request_remote_write_for_req(req_id, meta)
+            return
+
+        assert self.transfer_topo is not None
+        pending_by_rank: dict[
+            tuple[EngineId, int], list[tuple[ReqId, ReqMeta, float, dict[str, Any]]]
+        ] = defaultdict(list)
+
+        for req_id, meta in reqs:
+            request_start = time.perf_counter()
+            assert meta.remote is not None
+            engine_id = meta.remote.engine_id
+            plan = self.tp_mappings[engine_id]
+            local_block_ids = meta.local_physical_block_ids
+
+            if all(len(g) == 0 for g in local_block_ids):
+                self._request_remote_write_for_req(req_id, meta)
+                continue
+
+            payload = self._build_write_req_payload(req_id, meta)
+            for remote_rank in plan.all_source_ranks:
+                pending_by_rank[(engine_id, remote_rank)].append(
+                    (req_id, meta, request_start, payload)
+                )
+
+        for (engine_id, remote_rank), items in pending_by_rank.items():
+            for i in range(0, len(items), self.write_req_batch_max_size):
+                self._send_write_req_batch(
+                    engine_id,
+                    remote_rank,
+                    items[i : i + self.write_req_batch_max_size],
+                )
+
+    def _send_write_req_batch(
+        self,
+        engine_id: EngineId,
+        remote_rank: int,
+        items: list[tuple[ReqId, ReqMeta, float, dict[str, Any]]],
+    ) -> None:
+        if not items:
+            return
+
+        batch_start = min(request_start for _, _, request_start, _ in items)
+        encode_start = time.perf_counter()
+        payloads = [payload for _, _, _, payload in items]
+        encoded = WRITE_REQ_BATCH_MSG_PREFIX + msgspec.msgpack.encode(payloads)
+        encode_ms = (time.perf_counter() - encode_start) * 1000
+        send_start = time.perf_counter()
+        sent = 0
+        failed = 0
+        first_req_id, first_meta, _, _ = items[0]
+        assert first_meta.remote is not None
+        agent_name = self._remote_agents[engine_id][remote_rank]
+
+        try:
+            self.nixl_wrapper.send_notif(agent_name, notif_msg=encoded)
+            sent = 1
+            for req_id, _, request_start, _ in items:
+                self._write_req_sent_at[req_id] = request_start
+        except Exception as e:
+            failed = 1
+            for req_id, meta, _, _ in items:
+                self._log_failure(
+                    failure_type="write_request_batch_failed",
+                    req_id=req_id,
+                    error=e,
+                    meta=meta,
+                    dst_engine_id=engine_id,
+                    remote_rank=remote_rank,
+                )
+                self._handle_failed_transfer(req_id, None)
+
+        logger.info(
+            "NIXL perf write_req_batch_send first_req=%s first_remote_req=%s "
+            "remote_engine=%s remote_rank=%d batch_size=%d bytes=%d "
+            "encode_ms=%.3f send_ms=%.3f total_ms=%.3f sent=%d failed=%d",
+            first_req_id,
+            first_meta.remote.request_id,
+            engine_id,
+            remote_rank,
+            len(items),
+            len(encoded),
+            encode_ms,
+            (time.perf_counter() - send_start) * 1000,
+            (time.perf_counter() - batch_start) * 1000,
+            sent,
+            failed,
+        )
+
     def _request_remote_write_for_req(self, req_id: ReqId, meta: ReqMeta) -> None:
         request_start = time.perf_counter()
         assert meta.remote is not None and self.transfer_topo is not None
@@ -2005,18 +2132,8 @@ class NixlConnectorWorker:
             )
             return
 
-        assert self.xfer_handshake_metadata is not None
         encode_start = time.perf_counter()
-        payload = {
-            "decode_req_id": req_id,
-            "decode_engine_id": self.engine_id,
-            "decode_handshake": msgspec.msgpack.encode(self.xfer_handshake_metadata),
-            "decode_tp_size": self.world_size,
-            "decode_tp_rank": self.tp_rank,
-            "decode_block_ids": [list(g) for g in local_block_ids],
-            "prefill_req_id": meta.remote.request_id,
-            "prefill_block_ids": [list(g) for g in meta.remote.block_ids],
-        }
+        payload = self._build_write_req_payload(req_id, meta)
         encoded = WRITE_REQ_MSG_PREFIX + msgspec.msgpack.encode(payload)
         encode_ms = (time.perf_counter() - encode_start) * 1000
         send_start = time.perf_counter()
@@ -2106,7 +2223,32 @@ class NixlConnectorWorker:
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
                     for notif in notifs:
                         had_work = True
-                        if notif.startswith(WRITE_REQ_MSG_PREFIX):
+                        if notif.startswith(WRITE_REQ_BATCH_MSG_PREFIX):
+                            try:
+                                payloads = msgspec.msgpack.decode(
+                                    notif[len(WRITE_REQ_BATCH_MSG_PREFIX) :]
+                                )
+                                if not isinstance(payloads, list) or not payloads:
+                                    raise ValueError("empty or malformed batch")
+                                enqueued_at = time.perf_counter()
+                                for payload in payloads:
+                                    payload["_nixl_enqueue_time"] = enqueued_at
+                                self._write_req_queue.put(payloads)
+                                first_payload = payloads[0]
+                                logger.info(
+                                    "NIXL perf write_req_batch_enqueue "
+                                    "first_req=%s first_decode_req=%s "
+                                    "batch_size=%d queue_depth=%d",
+                                    first_payload.get("prefill_req_id"),
+                                    first_payload.get("decode_req_id"),
+                                    len(payloads),
+                                    self._write_req_queue.qsize(),
+                                )
+                            except Exception:
+                                logger.exception(
+                                    "Failed to enqueue batched NIXL WRITE request"
+                                )
+                        elif notif.startswith(WRITE_REQ_MSG_PREFIX):
                             try:
                                 payload = msgspec.msgpack.decode(
                                     notif[len(WRITE_REQ_MSG_PREFIX) :]
@@ -2154,14 +2296,15 @@ class NixlConnectorWorker:
 
     def _collect_write_req_batch(
         self, first_payload: dict[str, Any]
-    ) -> list[dict[str, Any]]:
+    ) -> tuple[list[dict[str, Any]], int]:
         if self.write_batch_max_size <= 1 or self.write_batch_wait_s <= 0:
-            return [first_payload]
+            return [first_payload], 1
 
         batch = [first_payload]
+        task_done_count = 1
         batch_key = self._write_req_batch_key(first_payload)
         deadline = time.perf_counter() + self.write_batch_wait_s
-        deferred: list[dict[str, Any]] = []
+        deferred: list[dict[str, Any] | list[dict[str, Any]]] = []
 
         try:
             while len(batch) < self.write_batch_max_size:
@@ -2178,8 +2321,17 @@ class NixlConnectorWorker:
                     self._write_req_queue.put(None)
                     break
 
-                if self._write_req_batch_key(payload) == batch_key:
-                    batch.append(payload)
+                payloads = payload if isinstance(payload, list) else [payload]
+                if not payloads:
+                    self._write_req_queue.task_done()
+                    continue
+
+                if (
+                    all(self._write_req_batch_key(p) == batch_key for p in payloads)
+                    and len(batch) + len(payloads) <= self.write_batch_max_size
+                ):
+                    batch.extend(payloads)
+                    task_done_count += 1
                 else:
                     deferred.append(payload)
         finally:
@@ -2187,7 +2339,7 @@ class NixlConnectorWorker:
                 self._write_req_queue.put(payload)
                 self._write_req_queue.task_done()
 
-        return batch
+        return batch, task_done_count
 
     def _write_sender_loop(self) -> None:
         while True:
@@ -2199,10 +2351,16 @@ class NixlConnectorWorker:
                 continue
 
             payloads: list[dict[str, Any]] | None = None
+            task_done_count = 1
             try:
                 if payload is None or self._write_req_poller_stop_event.is_set():
                     return
-                payloads = self._collect_write_req_batch(payload)
+                if isinstance(payload, list):
+                    payloads = payload
+                else:
+                    payloads, task_done_count = self._collect_write_req_batch(payload)
+                if not payloads:
+                    continue
                 if len(payloads) == 1:
                     self._handle_write_req(payloads[0])
                 else:
@@ -2210,10 +2368,10 @@ class NixlConnectorWorker:
             except Exception:
                 logger.exception("NIXL WRITE sender worker exception")
             finally:
-                if payloads is None:
+                if payloads is None or payload is None:
                     self._write_req_queue.task_done()
                 else:
-                    for _ in payloads:
+                    for _ in range(task_done_count):
                         self._write_req_queue.task_done()
 
     def _ensure_write_req_remote_agent(
