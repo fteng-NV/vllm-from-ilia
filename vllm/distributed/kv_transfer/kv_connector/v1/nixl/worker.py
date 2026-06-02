@@ -452,7 +452,7 @@ class NixlConnectorWorker:
         self.num_write_sender_workers = int(
             self.kv_transfer_config.get_from_extra_config(
                 "num_write_workers",
-                self.kv_transfer_config.get_from_extra_config("num_workers", 4),
+                self.kv_transfer_config.get_from_extra_config("num_workers", 10),
             )
         )
         if self.num_write_sender_workers <= 0:
