@@ -20,7 +20,7 @@ import vllm.envs as envs
 from vllm.logging_utils import ColoredFormatter, NewLineFormatter
 
 _FORMAT = (
-    f"{envs.VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s "
+    f"{envs.VLLM_LOGGING_PREFIX}%(levelname)s %(asctime)s.%(msecs)03d "
     "[%(fileinfo)s:%(lineno)d] %(message)s"
 )
 _DATE_FORMAT = "%m-%d %H:%M:%S"
