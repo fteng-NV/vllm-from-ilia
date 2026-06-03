@@ -150,11 +150,15 @@ class HeartbeatInfo:
 
 @dataclass
 class RemoteMeta:
-    block_ids: BlockIds
     host: str
     port: int
     engine_id: str
-    request_id: str
+    # Per-request prefill data. Populated by the sequential proxy. For the
+    # parallel control plane these are unknown on D, and P resolves its own
+    # source blocks by ``transfer_id`` instead.
+    block_ids: BlockIds = ()
+    request_id: str | None = None
+    transfer_id: str | None = None
 
 
 @dataclass
@@ -171,6 +175,10 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         self.reqs_to_recv: dict[ReqId, ReqMeta] = {}
         self.reqs_to_save: dict[ReqId, ReqMeta] = {}
         self.reqs_to_send: dict[ReqId, float] = {}
+        # Parallel control plane (P-side): transfer_id -> (prefill_req_id,
+        # prefill_block_ids). Lets the worker resolve its own source blocks
+        # when a decode-initiated write request arrives.
+        self.reqs_send_blocks: dict[str, tuple[ReqId, BlockIds]] = {}
         self.reqs_in_batch: set[ReqId] = set()
         self.reqs_not_processed: set[ReqId] = set()
         # Heartbeat data grouped by remote engine, sent by D worker to P.
@@ -205,11 +213,22 @@ class NixlConnectorMetadata(KVConnectorMetadata):
         kv_transfer_params: dict[str, Any],
     ):
         req = self._add_new_req(local_block_ids, kv_transfer_params)
-        req.remote = RemoteMeta(
-            block_ids=kv_transfer_params["remote_block_ids"],
-            engine_id=kv_transfer_params["remote_engine_id"],
-            request_id=kv_transfer_params["remote_request_id"],
-            host=kv_transfer_params["remote_host"],
-            port=kv_transfer_params["remote_port"],
-        )
+        if kv_transfer_params.get("remote_block_ids"):
+            # Sequential proxy: P's per-request blocks arrived via the proxy.
+            req.remote = RemoteMeta(
+                block_ids=kv_transfer_params["remote_block_ids"],
+                engine_id=kv_transfer_params["remote_engine_id"],
+                request_id=kv_transfer_params["remote_request_id"],
+                host=kv_transfer_params["remote_host"],
+                port=kv_transfer_params["remote_port"],
+            )
+        else:
+            # Parallel proxy: only P's static identity + a shared transfer_id.
+            # P resolves its own source blocks by transfer_id.
+            req.remote = RemoteMeta(
+                engine_id=kv_transfer_params["remote_engine_id"],
+                host=kv_transfer_params["remote_host"],
+                port=kv_transfer_params["remote_port"],
+                transfer_id=kv_transfer_params["transfer_id"],
+            )
         self.reqs_to_recv[request_id] = req

@@ -498,6 +498,20 @@ class NixlConnectorWorker:
         self._write_full_hit_reqs: set[ReqId] = set()
         self._write_req_sent_at: dict[ReqId, float] = {}
 
+        # Parallel control plane (P-side). When the proxy dispatches D in
+        # parallel with P, D's write request carries only a shared transfer_id
+        # (not P's blocks). We resolve P's own source blocks here.
+        # transfer_id -> (prefill_req_id, prefill_block_ids)
+        self._prefill_blocks_by_xfer: dict[str, tuple[ReqId, Any]] = {}
+        # prefill_req_id -> transfer_id, for cleanup once the write completes.
+        self._xfer_id_by_req: dict[ReqId, str] = {}
+        # Write requests received before P finished its prefill (their blocks
+        # aren't resolvable yet); retried on every poll iteration.
+        self._pending_xfer_payloads: list[dict[str, Any]] = []
+        self._prefill_blocks_lock = threading.Lock()
+        # Drop a buffered write request whose prefill never materializes.
+        self._pending_xfer_timeout_ms: float = 30000.0
+
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
         kernel_block_size = select_common_block_size(self.block_size, backends)
@@ -1953,6 +1967,21 @@ class NixlConnectorWorker:
             if req_id in self._reqs_to_process:
                 self._reqs_to_send[req_id] = expiration_time
 
+        # Parallel control plane (P-side): register our own source blocks under
+        # the shared transfer_id so the write poller can resolve buffered
+        # decode-initiated write requests.
+        if metadata.reqs_send_blocks:
+            with self._prefill_blocks_lock:
+                for transfer_id, (
+                    prefill_req_id,
+                    block_ids,
+                ) in metadata.reqs_send_blocks.items():
+                    self._prefill_blocks_by_xfer[transfer_id] = (
+                        prefill_req_id,
+                        block_ids,
+                    )
+                    self._xfer_id_by_req[prefill_req_id] = transfer_id
+
         # Send heartbeats to P-side engines to keep KV blocks alive while
         # requests sit in the D scheduler WAITING queue.
         self._send_heartbeats(metadata)
@@ -1988,7 +2017,7 @@ class NixlConnectorWorker:
         assert self.xfer_handshake_metadata is not None
         assert meta.remote is not None
         local_block_ids = meta.local_physical_block_ids
-        return {
+        payload: dict[str, Any] = {
             "decode_req_id": req_id,
             "decode_engine_id": self.engine_id,
             "decode_handshake": msgspec.msgpack.encode(
@@ -1997,9 +2026,17 @@ class NixlConnectorWorker:
             "decode_tp_size": self.world_size,
             "decode_tp_rank": self.tp_rank,
             "decode_block_ids": [list(g) for g in local_block_ids],
-            "prefill_req_id": meta.remote.request_id,
-            "prefill_block_ids": [list(g) for g in meta.remote.block_ids],
         }
+        if meta.remote.transfer_id is not None:
+            # Parallel control plane: P resolves its own source blocks by
+            # transfer_id (it never sent them through the proxy).
+            payload["transfer_id"] = meta.remote.transfer_id
+        else:
+            payload["prefill_req_id"] = meta.remote.request_id
+            payload["prefill_block_ids"] = [
+                list(g) for g in meta.remote.block_ids
+            ]
+        return payload
 
     def _request_remote_write_for_reqs(
         self, reqs: list[tuple[ReqId, ReqMeta]]
@@ -2106,7 +2143,10 @@ class NixlConnectorWorker:
         local_block_ids = meta.local_physical_block_ids
 
         if all(len(g) == 0 for g in local_block_ids):
-            notif_id = f"{meta.remote.request_id}:{self.world_size}".encode()
+            # Parallel path has no P request id on D; key the free notification
+            # by transfer_id so P can resolve it back to its own request.
+            free_id = meta.remote.request_id or meta.remote.transfer_id
+            notif_id = f"{free_id}:{self.world_size}".encode()
             for remote_rank in plan.all_source_ranks:
                 agent_name = self._remote_agents[engine_id][remote_rank]
                 try:
@@ -2219,6 +2259,8 @@ class NixlConnectorWorker:
 
         while not self._write_req_poller_stop_event.is_set():
             try:
+                # Retry any write requests that arrived before P's prefill.
+                self._drain_pending_xfer_payloads()
                 had_work = False
                 for notifs in self.nixl_wrapper.get_new_notifs().values():
                     for notif in notifs:
@@ -2233,7 +2275,7 @@ class NixlConnectorWorker:
                                 enqueued_at = time.perf_counter()
                                 for payload in payloads:
                                     payload["_nixl_enqueue_time"] = enqueued_at
-                                self._write_req_queue.put(payloads)
+                                self._enqueue_write_payloads(payloads, batched=True)
                                 first_payload = payloads[0]
                                 logger.info(
                                     "NIXL perf write_req_batch_enqueue "
@@ -2254,7 +2296,9 @@ class NixlConnectorWorker:
                                     notif[len(WRITE_REQ_MSG_PREFIX) :]
                                 )
                                 payload["_nixl_enqueue_time"] = time.perf_counter()
-                                self._write_req_queue.put(payload)
+                                self._enqueue_write_payloads(
+                                    [payload], batched=False
+                                )
                                 logger.info(
                                     "NIXL perf write_req_enqueue req=%s "
                                     "decode_req=%s queue_depth=%d",
@@ -2280,6 +2324,84 @@ class NixlConnectorWorker:
             except Exception:
                 logger.exception("NIXL WRITE poller exception")
                 time.sleep(0.01)
+
+    def _needs_xfer_resolution(self, payload: dict[str, Any]) -> bool:
+        """A parallel-control-plane write request carries only a transfer_id;
+        P must resolve its own source blocks before it can be handled."""
+        return (
+            payload.get("transfer_id") is not None
+            and "prefill_block_ids" not in payload
+        )
+
+    def _try_resolve_xfer_payload(self, payload: dict[str, Any]) -> bool:
+        """Inject P's own (prefill_req_id, prefill_block_ids) into *payload*
+        using the transfer_id -> blocks cache. Returns True once resolved."""
+        transfer_id = payload.get("transfer_id")
+        with self._prefill_blocks_lock:
+            entry = self._prefill_blocks_by_xfer.get(transfer_id)
+        if entry is None:
+            return False
+        prefill_req_id, block_ids = entry
+        payload["prefill_req_id"] = prefill_req_id
+        payload["prefill_block_ids"] = [list(g) for g in block_ids]
+        return True
+
+    def _enqueue_write_payloads(
+        self, payloads: list[dict[str, Any]], batched: bool
+    ) -> None:
+        """Enqueue write requests, buffering any parallel-path payload whose
+        prefill blocks aren't resolvable yet (P hasn't finished prefill)."""
+        ready: list[dict[str, Any]] = []
+        for payload in payloads:
+            if self._needs_xfer_resolution(payload):
+                if not self._try_resolve_xfer_payload(payload):
+                    payload.setdefault("_nixl_hold_time", time.perf_counter())
+                    with self._prefill_blocks_lock:
+                        self._pending_xfer_payloads.append(payload)
+                    continue
+            ready.append(payload)
+
+        if not ready:
+            return
+        if batched and len(ready) > 1:
+            self._write_req_queue.put(ready)
+        else:
+            for payload in ready:
+                self._write_req_queue.put(payload)
+
+    def _drain_pending_xfer_payloads(self) -> None:
+        """Retry buffered parallel-path write requests; drop ones whose prefill
+        never materialized within the timeout."""
+        with self._prefill_blocks_lock:
+            if not self._pending_xfer_payloads:
+                return
+            pending = self._pending_xfer_payloads
+            self._pending_xfer_payloads = []
+
+        still_pending: list[dict[str, Any]] = []
+        for payload in pending:
+            if self._try_resolve_xfer_payload(payload):
+                self._write_req_queue.put(payload)
+                continue
+            held_ms = (
+                time.perf_counter() - payload.get("_nixl_hold_time", 0.0)
+            ) * 1000
+            if held_ms > self._pending_xfer_timeout_ms:
+                logger.warning(
+                    "Dropping NIXL write request: prefill blocks for "
+                    "transfer_id=%s, decode_req=%s not available after %.0f ms",
+                    payload.get("transfer_id"),
+                    payload.get("decode_req_id"),
+                    held_ms,
+                )
+            else:
+                still_pending.append(payload)
+
+        if still_pending:
+            with self._prefill_blocks_lock:
+                self._pending_xfer_payloads = (
+                    still_pending + self._pending_xfer_payloads
+                )
 
     def _bind_write_sender_thread_device(self) -> None:
         if not self.use_host_buffer:
@@ -2924,6 +3046,12 @@ class NixlConnectorWorker:
         except Exception:
             logger.warning("Malformed write-free notification %r", notif[:32])
             return
+        # Parallel path: the notif may be keyed by transfer_id; map it back to
+        # P's own request id so the lease bookkeeping clears correctly.
+        with self._prefill_blocks_lock:
+            entry = self._prefill_blocks_by_xfer.get(req_id)
+        if entry is not None:
+            req_id = entry[0]
         self._mark_write_send_done(req_id, int(tp_size))
 
     def _drain_background_done_sending(self) -> set[ReqId]:
@@ -2935,6 +3063,11 @@ class NixlConnectorWorker:
         for req_id in done:
             self._reqs_to_process.discard(req_id)
             self._reqs_to_send.pop(req_id, None)
+            # Parallel control plane: release the resolved-blocks cache entry.
+            transfer_id = self._xfer_id_by_req.pop(req_id, None)
+            if transfer_id is not None:
+                with self._prefill_blocks_lock:
+                    self._prefill_blocks_by_xfer.pop(transfer_id, None)
         return done
 
     def _drain_write_done_notifs(self) -> set[ReqId]:

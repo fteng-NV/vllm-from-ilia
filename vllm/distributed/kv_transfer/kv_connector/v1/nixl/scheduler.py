@@ -108,6 +108,10 @@ class NixlConnectorScheduler:
         self._reqs_need_save: dict[ReqId, Request] = {}
         # Reqs to send and their expiration time
         self._reqs_need_send: dict[ReqId, float] = {}
+        # Parallel control plane (P-side): transfer_id -> (req_id, block_ids).
+        # Lets the worker resolve its own source blocks when a decode-initiated
+        # write request arrives (without P's blocks flowing through the proxy).
+        self._reqs_send_blocks: dict[str, tuple[ReqId, BlockIds]] = {}
         self._reqs_in_batch: set[ReqId] = set()
         # Reqs to remove from processed set because they're not to send after
         # remote prefill or aborted.
@@ -503,6 +507,23 @@ class NixlConnectorScheduler:
                         "request will not utilize KVTransfer",
                         params,
                     )
+            elif params.get("transfer_id") and all(
+                p in params
+                for p in ("remote_engine_id", "remote_host", "remote_port")
+            ):
+                # Parallel control plane: D was dispatched without P's
+                # per-request blocks. Record D's own (local) blocks; P resolves
+                # its source blocks by transfer_id when the write request lands.
+                unhashed_local_block_ids: BlockIds = (
+                    blocks.get_unhashed_block_ids_all_groups()
+                    if num_external_tokens > 0
+                    else ()
+                )
+                local_block_ids = self.get_sw_clipped_blocks(unhashed_local_block_ids)
+                self._reqs_need_recv[request.request_id] = (
+                    request,
+                    local_block_ids,
+                )
             else:
                 assert num_external_tokens == 0
             # Only trigger 1 KV transfer per request.
@@ -563,6 +584,7 @@ class NixlConnectorScheduler:
             self._build_save_meta(meta, scheduler_output)
 
         meta.reqs_to_send = self._reqs_need_send
+        meta.reqs_send_blocks = self._reqs_send_blocks
         meta.reqs_in_batch = self._reqs_in_batch
         meta.reqs_not_processed = self._reqs_not_processed
 
@@ -578,6 +600,7 @@ class NixlConnectorScheduler:
         self._reqs_in_batch = set()
         self._reqs_not_processed = set()
         self._reqs_need_send = {}
+        self._reqs_send_blocks = {}
 
         return meta
 
@@ -673,6 +696,13 @@ class NixlConnectorScheduler:
             block_ids = self.get_sw_clipped_blocks(block_ids)
 
             remote_num_tokens = request.num_computed_tokens
+
+            # Parallel control plane: stash our own blocks under the shared
+            # transfer_id so the worker can resolve them when D's write request
+            # arrives (the proxy never forwards these to D).
+            transfer_id = params.get("transfer_id")
+            if is_p_node and transfer_id is not None:
+                self._reqs_send_blocks[transfer_id] = (request.request_id, block_ids)
 
         return delay_free_blocks, dict(
             do_remote_prefill=is_p_node,
