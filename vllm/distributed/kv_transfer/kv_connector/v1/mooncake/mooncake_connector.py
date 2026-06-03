@@ -583,6 +583,10 @@ class MooncakeConnectorScheduler:
                 logger.info("KV TTFT arrival req=%s", request.request_id)
                 return count, True
 
+        if params.get("do_remote_decode"):
+            # P-side: request first considered for local prefill (decoded remotely).
+            logger.info("KV TTFT P_arrival req=%s", request.request_id)
+
         # No remote prefill for this request.
         return 0, False
 
@@ -704,6 +708,8 @@ class MooncakeConnectorScheduler:
             return False, None
 
         assert not self.is_kv_consumer
+        # P-side: local prefill done, KV ready to hand back to the router/D.
+        logger.info("KV TTFT P_release req=%s", request.request_id)
 
         if request.status != RequestStatus.FINISHED_LENGTH_CAPPED:
             # Also include the case of a P/D Prefill request with immediate

@@ -388,6 +388,14 @@ class NixlConnectorScheduler:
                 logger.info("KV TTFT arrival req=%s", request.request_id)
                 return count, True
 
+        if (
+            params is not None
+            and params.get("do_remote_decode")
+            and not params.get("remote_block_ids")
+        ):
+            # P-side: request first considered for local prefill (decoded remotely).
+            logger.info("KV TTFT P_arrival req=%s", request.request_id)
+
         if params is not None and params.get("do_remote_decode") and self._has_mamba:
             self._truncate_mamba_request_for_prefill(request)
 
@@ -602,6 +610,10 @@ class NixlConnectorScheduler:
 
         is_p_node = bool(params.get("do_remote_decode"))
         is_d_node = not is_p_node
+
+        if is_p_node:
+            # P-side: local prefill done, KV ready to hand back to the router/D.
+            logger.info("KV TTFT P_release req=%s", request.request_id)
 
         # Stop heartbeating for aborted requests that never reached finished_recving:
         # normal path cleans up in update_connector_output.
