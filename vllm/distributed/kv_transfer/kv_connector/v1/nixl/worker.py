@@ -291,7 +291,7 @@ class NixlConnectorWorker:
             config = (
                 nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
                 if len(non_ucx_backends) > 0
-                else nixl_agent_config(num_threads=num_threads, capture_telemetry=True)
+                else nixl_agent_config(num_threads=0, capture_telemetry=True)
             )
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
