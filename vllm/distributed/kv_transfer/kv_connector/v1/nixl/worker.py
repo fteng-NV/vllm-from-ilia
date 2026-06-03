@@ -496,7 +496,6 @@ class NixlConnectorWorker:
         self._write_req_poller_stop_event = threading.Event()
         self._write_req_poller_t: threading.Thread | None = None
         self._write_full_hit_reqs: set[ReqId] = set()
-        self._write_req_sent_at: dict[ReqId, float] = {}
 
         # Parallel control plane (P-side). When the proxy dispatches D in
         # parallel with P, D's write request carries only a shared transfer_id
@@ -1906,7 +1905,6 @@ class NixlConnectorWorker:
         self._failed_recv_reqs.put(req_id)
         if handle is not None:
             self.nixl_wrapper.release_xfer_handle(handle)
-        self._write_req_sent_at.pop(req_id, None)
         self.xfer_stats.record_failed_transfer()
 
     def start_load_kv(self, metadata: NixlConnectorMetadata):
@@ -2051,11 +2049,10 @@ class NixlConnectorWorker:
 
         assert self.transfer_topo is not None
         pending_by_rank: dict[
-            tuple[EngineId, int], list[tuple[ReqId, ReqMeta, float, dict[str, Any]]]
+            tuple[EngineId, int], list[tuple[ReqId, ReqMeta, dict[str, Any]]]
         ] = defaultdict(list)
 
         for req_id, meta in reqs:
-            request_start = time.perf_counter()
             assert meta.remote is not None
             engine_id = meta.remote.engine_id
             plan = self.tp_mappings[engine_id]
@@ -2068,7 +2065,7 @@ class NixlConnectorWorker:
             payload = self._build_write_req_payload(req_id, meta)
             for remote_rank in plan.all_source_ranks:
                 pending_by_rank[(engine_id, remote_rank)].append(
-                    (req_id, meta, request_start, payload)
+                    (req_id, meta, payload)
                 )
 
         for (engine_id, remote_rank), items in pending_by_rank.items():
@@ -2083,31 +2080,19 @@ class NixlConnectorWorker:
         self,
         engine_id: EngineId,
         remote_rank: int,
-        items: list[tuple[ReqId, ReqMeta, float, dict[str, Any]]],
+        items: list[tuple[ReqId, ReqMeta, dict[str, Any]]],
     ) -> None:
         if not items:
             return
 
-        batch_start = min(request_start for _, _, request_start, _ in items)
-        encode_start = time.perf_counter()
-        payloads = [payload for _, _, _, payload in items]
+        payloads = [payload for _, _, payload in items]
         encoded = WRITE_REQ_BATCH_MSG_PREFIX + msgspec.msgpack.encode(payloads)
-        encode_ms = (time.perf_counter() - encode_start) * 1000
-        send_start = time.perf_counter()
-        sent = 0
-        failed = 0
-        first_req_id, first_meta, _, _ = items[0]
-        assert first_meta.remote is not None
         agent_name = self._remote_agents[engine_id][remote_rank]
 
         try:
             self.nixl_wrapper.send_notif(agent_name, notif_msg=encoded)
-            sent = 1
-            for req_id, _, request_start, _ in items:
-                self._write_req_sent_at[req_id] = request_start
         except Exception as e:
-            failed = 1
-            for req_id, meta, _, _ in items:
+            for req_id, meta, _ in items:
                 self._log_failure(
                     failure_type="write_request_batch_failed",
                     req_id=req_id,
@@ -2118,25 +2103,7 @@ class NixlConnectorWorker:
                 )
                 self._handle_failed_transfer(req_id, None)
 
-        logger.info(
-            "NIXL perf write_req_batch_send first_req=%s first_remote_req=%s "
-            "remote_engine=%s remote_rank=%d batch_size=%d bytes=%d "
-            "encode_ms=%.3f send_ms=%.3f total_ms=%.3f sent=%d failed=%d",
-            first_req_id,
-            first_meta.remote.request_id,
-            engine_id,
-            remote_rank,
-            len(items),
-            len(encoded),
-            encode_ms,
-            (time.perf_counter() - send_start) * 1000,
-            (time.perf_counter() - batch_start) * 1000,
-            sent,
-            failed,
-        )
-
     def _request_remote_write_for_req(self, req_id: ReqId, meta: ReqMeta) -> None:
-        request_start = time.perf_counter()
         assert meta.remote is not None and self.transfer_topo is not None
         engine_id = meta.remote.engine_id
         plan = self.tp_mappings[engine_id]
@@ -2161,31 +2128,15 @@ class NixlConnectorWorker:
                     )
                     self.xfer_stats.record_failed_notification()
             self._write_full_hit_reqs.add(req_id)
-            logger.info(
-                "NIXL perf write_req_full_hit req=%s remote_req=%s "
-                "remote_engine=%s ranks=%s total_ms=%.3f",
-                req_id,
-                meta.remote.request_id,
-                engine_id,
-                plan.all_source_ranks,
-                (time.perf_counter() - request_start) * 1000,
-            )
             return
 
-        encode_start = time.perf_counter()
         payload = self._build_write_req_payload(req_id, meta)
         encoded = WRITE_REQ_MSG_PREFIX + msgspec.msgpack.encode(payload)
-        encode_ms = (time.perf_counter() - encode_start) * 1000
-        send_start = time.perf_counter()
-        sent = 0
-        failed = 0
         for remote_rank in plan.all_source_ranks:
             agent_name = self._remote_agents[engine_id][remote_rank]
             try:
                 self.nixl_wrapper.send_notif(agent_name, notif_msg=encoded)
-                sent += 1
             except Exception as e:
-                failed += 1
                 self._log_failure(
                     failure_type="write_request_failed",
                     req_id=req_id,
@@ -2194,23 +2145,6 @@ class NixlConnectorWorker:
                     remote_rank=remote_rank,
                 )
                 self._handle_failed_transfer(req_id, None)
-        if sent and failed == 0:
-            self._write_req_sent_at[req_id] = request_start
-        logger.info(
-            "NIXL perf write_req_send req=%s remote_req=%s remote_engine=%s "
-            "ranks=%s bytes=%d encode_ms=%.3f send_ms=%.3f total_ms=%.3f "
-            "sent=%d failed=%d",
-            req_id,
-            meta.remote.request_id,
-            engine_id,
-            plan.all_source_ranks,
-            len(encoded),
-            encode_ms,
-            (time.perf_counter() - send_start) * 1000,
-            (time.perf_counter() - request_start) * 1000,
-            sent,
-            failed,
-        )
 
     def _handle_write_done_notif(
         self, notif: bytes, done_recving: set[ReqId] | None = None
@@ -2272,20 +2206,7 @@ class NixlConnectorWorker:
                                 )
                                 if not isinstance(payloads, list) or not payloads:
                                     raise ValueError("empty or malformed batch")
-                                enqueued_at = time.perf_counter()
-                                for payload in payloads:
-                                    payload["_nixl_enqueue_time"] = enqueued_at
                                 self._enqueue_write_payloads(payloads, batched=True)
-                                first_payload = payloads[0]
-                                logger.info(
-                                    "NIXL perf write_req_batch_enqueue "
-                                    "first_req=%s first_decode_req=%s "
-                                    "batch_size=%d queue_depth=%d",
-                                    first_payload.get("prefill_req_id"),
-                                    first_payload.get("decode_req_id"),
-                                    len(payloads),
-                                    self._write_req_queue.qsize(),
-                                )
                             except Exception:
                                 logger.exception(
                                     "Failed to enqueue batched NIXL WRITE request"
@@ -2295,16 +2216,8 @@ class NixlConnectorWorker:
                                 payload = msgspec.msgpack.decode(
                                     notif[len(WRITE_REQ_MSG_PREFIX) :]
                                 )
-                                payload["_nixl_enqueue_time"] = time.perf_counter()
                                 self._enqueue_write_payloads(
                                     [payload], batched=False
-                                )
-                                logger.info(
-                                    "NIXL perf write_req_enqueue req=%s "
-                                    "decode_req=%s queue_depth=%d",
-                                    payload.get("prefill_req_id"),
-                                    payload.get("decode_req_id"),
-                                    self._write_req_queue.qsize(),
                                 )
                             except Exception:
                                 logger.exception(
@@ -2518,25 +2431,11 @@ class NixlConnectorWorker:
             self._remote_agents[decode_engine_id][decode_tp_rank] = agent_name
 
     def _handle_write_req(self, payload: dict[str, Any]) -> None:
-        handler_start = time.perf_counter()
         decode_engine_id = payload["decode_engine_id"]
         decode_tp_size = int(payload["decode_tp_size"])
         decode_tp_rank = int(payload["decode_tp_rank"])
         prefill_req_id = payload["prefill_req_id"]
         decode_req_id = payload["decode_req_id"]
-        queue_wait_ms: float | None = None
-        enqueued_at = payload.get("_nixl_enqueue_time")
-        if isinstance(enqueued_at, float):
-            queue_wait_ms = (handler_start - enqueued_at) * 1000
-        logger.info(
-            "NIXL perf write_req_start req=%s decode_req=%s decode_rank=%d "
-            "queue_wait_ms=%s queue_depth=%d",
-            prefill_req_id,
-            decode_req_id,
-            decode_tp_rank,
-            f"{queue_wait_ms:.3f}" if queue_wait_ms is not None else "n/a",
-            self._write_req_queue.qsize(),
-        )
         mark_done = True
 
         try:
@@ -2565,58 +2464,21 @@ class NixlConnectorWorker:
         finally:
             if mark_done:
                 self._mark_write_send_done(prefill_req_id, decode_tp_size)
-            logger.info(
-                "NIXL perf write_req_finish req=%s decode_req=%s "
-                "decode_rank=%d total_ms=%.3f mark_done=%s",
-                prefill_req_id,
-                decode_req_id,
-                decode_tp_rank,
-                (time.perf_counter() - handler_start) * 1000,
-                mark_done,
-            )
 
     def _handle_write_req_batch(self, payloads: list[dict[str, Any]]) -> None:
-        handler_start = time.perf_counter()
         first_payload = payloads[0]
         decode_engine_id = first_payload["decode_engine_id"]
         decode_tp_size = int(first_payload["decode_tp_size"])
         decode_tp_rank = int(first_payload["decode_tp_rank"])
         prefill_req_ids = [payload["prefill_req_id"] for payload in payloads]
-        decode_req_ids = [payload["decode_req_id"] for payload in payloads]
         mark_done_by_req = {req_id: True for req_id in prefill_req_ids}
-
-        queue_waits_ms: list[float] = []
-        for payload in payloads:
-            enqueued_at = payload.get("_nixl_enqueue_time")
-            if isinstance(enqueued_at, float):
-                queue_waits_ms.append((handler_start - enqueued_at) * 1000)
-        queue_wait_min = min(queue_waits_ms) if queue_waits_ms else None
-        queue_wait_max = max(queue_waits_ms) if queue_waits_ms else None
-        logger.info(
-            "NIXL perf write_batch_start first_req=%s first_decode_req=%s "
-            "decode_engine=%s decode_rank=%d batch_size=%d "
-            "queue_wait_min_ms=%s queue_wait_max_ms=%s queue_depth=%d",
-            prefill_req_ids[0],
-            decode_req_ids[0],
-            decode_engine_id,
-            decode_tp_rank,
-            len(payloads),
-            f"{queue_wait_min:.3f}" if queue_wait_min is not None else "n/a",
-            f"{queue_wait_max:.3f}" if queue_wait_max is not None else "n/a",
-            self._write_req_queue.qsize(),
-        )
 
         transfer_prefill_req_ids: list[ReqId] = []
         transfer_decode_req_ids: list[ReqId] = []
         src_desc_parts: list[np.ndarray] = []
         dst_desc_parts: list[np.ndarray] = []
-        total_src_blocks = 0
-        total_dst_blocks = 0
-        total_desc_count = 0
-        tp_ratio: int | str = "n/a"
         local_handle: TransferHandle | None = None
         remote_handle: TransferHandle | None = None
-        prepare_ms = 0.0
         handle = None
 
         try:
@@ -2624,7 +2486,6 @@ class NixlConnectorWorker:
                 first_payload, decode_engine_id, decode_tp_rank, decode_tp_size
             )
 
-            prepare_start = time.perf_counter()
             for payload in payloads:
                 prefill_req_id = payload["prefill_req_id"]
                 decode_req_id = payload["decode_req_id"]
@@ -2648,15 +2509,14 @@ class NixlConnectorWorker:
                         req_remote_handle,
                         src_desc_ids,
                         dst_desc_ids,
-                        req_tp_ratio,
-                        src_block_count,
-                        dst_block_count,
-                        desc_count,
+                        _req_tp_ratio,
+                        _src_block_count,
+                        _dst_block_count,
+                        _desc_count,
                     ) = prepared
                     if local_handle is None:
                         local_handle = req_local_handle
                         remote_handle = req_remote_handle
-                        tp_ratio = req_tp_ratio
                     elif (
                         local_handle != req_local_handle
                         or remote_handle != req_remote_handle
@@ -2669,9 +2529,6 @@ class NixlConnectorWorker:
                     transfer_decode_req_ids.append(decode_req_id)
                     src_desc_parts.append(src_desc_ids)
                     dst_desc_parts.append(dst_desc_ids)
-                    total_src_blocks += src_block_count
-                    total_dst_blocks += dst_block_count
-                    total_desc_count += desc_count
                 except Exception as e:
                     self._log_failure(
                         failure_type="write_batch_prepare_failed",
@@ -2681,7 +2538,6 @@ class NixlConnectorWorker:
                         decode_tp_rank=decode_tp_rank,
                     )
                     self.xfer_stats.record_failed_transfer()
-            prepare_ms = (time.perf_counter() - prepare_start) * 1000
 
             if not transfer_prefill_req_ids:
                 return
@@ -2694,7 +2550,6 @@ class NixlConnectorWorker:
                 f"{len(transfer_prefill_req_ids) - 1}"
             )
 
-            make_start = time.perf_counter()
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "WRITE",
                 local_handle,
@@ -2704,54 +2559,12 @@ class NixlConnectorWorker:
                 notif_msg=WRITE_DONE_BATCH_MSG_PREFIX
                 + msgspec.msgpack.encode(transfer_decode_req_ids),
             )
-            make_ms = (time.perf_counter() - make_start) * 1000
-            post_start = time.perf_counter()
             self.nixl_wrapper.transfer(handle)
-            post_call_ms = (time.perf_counter() - post_start) * 1000
-            wait_start = time.perf_counter()
-            mark_done, telemetry, polls = self._wait_for_write_handle(
+            mark_done, _telemetry, _polls = self._wait_for_write_handle(
                 batch_req_id, handle
             )
-            wait_ms = (time.perf_counter() - wait_start) * 1000
             for req_id in transfer_prefill_req_ids:
                 mark_done_by_req[req_id] = mark_done
-            logger.info(
-                "NIXL perf write_batch_breakdown first_req=%s "
-                "first_decode_req=%s decode_engine=%s decode_rank=%d "
-                "batch_size=%d xfer_reqs=%d tp_ratio=%s src_blocks=%d "
-                "dst_blocks=%d descs=%d prepare_ms=%.3f make_ms=%.3f "
-                "post_call_ms=%.3f wait_ms=%.3f total_ms=%.3f polls=%d "
-                "telemetry_post_ms=%s telemetry_xfer_ms=%s bytes=%s "
-                "telemetry_descs=%s",
-                prefill_req_ids[0],
-                decode_req_ids[0],
-                decode_engine_id,
-                decode_tp_rank,
-                len(payloads),
-                len(transfer_prefill_req_ids),
-                tp_ratio,
-                total_src_blocks,
-                total_dst_blocks,
-                total_desc_count,
-                prepare_ms,
-                make_ms,
-                post_call_ms,
-                wait_ms,
-                (time.perf_counter() - handler_start) * 1000,
-                polls,
-                (
-                    f"{telemetry.postDuration / 1000:.3f}"
-                    if telemetry is not None
-                    else "n/a"
-                ),
-                (
-                    f"{telemetry.xferDuration / 1000:.3f}"
-                    if telemetry is not None
-                    else "n/a"
-                ),
-                getattr(telemetry, "totalBytes", "n/a"),
-                getattr(telemetry, "descCount", "n/a"),
-            )
         except Exception as e:
             for req_id in transfer_prefill_req_ids or prefill_req_ids:
                 self._log_failure(
@@ -2764,34 +2577,10 @@ class NixlConnectorWorker:
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
-            logger.info(
-                "NIXL perf write_batch_breakdown_failed first_req=%s "
-                "first_decode_req=%s decode_engine=%s decode_rank=%d "
-                "batch_size=%d xfer_reqs=%d descs=%d prepare_ms=%.3f "
-                "total_ms=%.3f",
-                prefill_req_ids[0],
-                decode_req_ids[0],
-                decode_engine_id,
-                decode_tp_rank,
-                len(payloads),
-                len(transfer_prefill_req_ids),
-                total_desc_count,
-                prepare_ms,
-                (time.perf_counter() - handler_start) * 1000,
-            )
         finally:
             for req_id, mark_done in mark_done_by_req.items():
                 if mark_done:
                     self._mark_write_send_done(req_id, decode_tp_size)
-            logger.info(
-                "NIXL perf write_batch_finish first_req=%s first_decode_req=%s "
-                "decode_rank=%d batch_size=%d total_ms=%.3f",
-                prefill_req_ids[0],
-                decode_req_ids[0],
-                decode_tp_rank,
-                len(payloads),
-                (time.perf_counter() - handler_start) * 1000,
-            )
 
     def _prepare_write_blocks(
         self,
@@ -2872,7 +2661,6 @@ class NixlConnectorWorker:
         prefill_block_ids: BlockIds,
         decode_block_ids: BlockIds,
     ) -> bool:
-        total_start = time.perf_counter()
         prepared = self._prepare_write_blocks(
             prefill_block_ids=prefill_block_ids,
             decode_block_ids=decode_block_ids,
@@ -2887,15 +2675,13 @@ class NixlConnectorWorker:
             remote_handle,
             src_desc_ids,
             dst_desc_ids,
-            tp_ratio,
-            src_block_count,
-            dst_block_count,
-            desc_count,
+            _tp_ratio,
+            _src_block_count,
+            _dst_block_count,
+            _desc_count,
         ) = prepared
-        prepare_ms = (time.perf_counter() - total_start) * 1000
         handle = None
         try:
-            make_start = time.perf_counter()
             handle = self.nixl_wrapper.make_prepped_xfer(
                 "WRITE",
                 local_handle,
@@ -2904,48 +2690,9 @@ class NixlConnectorWorker:
                 dst_desc_ids,
                 notif_msg=WRITE_DONE_MSG_PREFIX + decode_req_id.encode("utf-8"),
             )
-            make_ms = (time.perf_counter() - make_start) * 1000
-            post_start = time.perf_counter()
             self.nixl_wrapper.transfer(handle)
-            post_call_ms = (time.perf_counter() - post_start) * 1000
-            wait_start = time.perf_counter()
-            mark_done, telemetry, polls = self._wait_for_write_handle(
+            mark_done, _telemetry, _polls = self._wait_for_write_handle(
                 prefill_req_id, handle
-            )
-            wait_ms = (time.perf_counter() - wait_start) * 1000
-            logger.info(
-                "NIXL perf write_breakdown req=%s decode_req=%s "
-                "decode_engine=%s decode_rank=%d tp_ratio=%s "
-                "src_blocks=%d dst_blocks=%d descs=%d prepare_ms=%.3f "
-                "make_ms=%.3f post_call_ms=%.3f wait_ms=%.3f "
-                "total_ms=%.3f polls=%d telemetry_post_ms=%s "
-                "telemetry_xfer_ms=%s bytes=%s telemetry_descs=%s",
-                prefill_req_id,
-                decode_req_id,
-                decode_engine_id,
-                decode_tp_rank,
-                tp_ratio,
-                src_block_count,
-                dst_block_count,
-                desc_count,
-                prepare_ms,
-                make_ms,
-                post_call_ms,
-                wait_ms,
-                (time.perf_counter() - total_start) * 1000,
-                polls,
-                (
-                    f"{telemetry.postDuration / 1000:.3f}"
-                    if telemetry is not None
-                    else "n/a"
-                ),
-                (
-                    f"{telemetry.xferDuration / 1000:.3f}"
-                    if telemetry is not None
-                    else "n/a"
-                ),
-                getattr(telemetry, "totalBytes", "n/a"),
-                getattr(telemetry, "descCount", "n/a"),
             )
             return mark_done
         except Exception as e:
@@ -2959,18 +2706,6 @@ class NixlConnectorWorker:
             self.xfer_stats.record_failed_transfer()
             if handle is not None:
                 self.nixl_wrapper.release_xfer_handle(handle)
-            logger.info(
-                "NIXL perf write_breakdown_failed req=%s decode_req=%s "
-                "decode_engine=%s decode_rank=%d descs=%d prepare_ms=%.3f "
-                "total_ms=%.3f",
-                prefill_req_id,
-                decode_req_id,
-                decode_engine_id,
-                decode_tp_rank,
-                desc_count,
-                prepare_ms,
-                (time.perf_counter() - total_start) * 1000,
-            )
             return True
 
     def _wait_for_write_handle(
@@ -3084,14 +2819,6 @@ class NixlConnectorWorker:
                         notif[:24],
                         self.tp_rank,
                     )
-        for req_id in done_recving:
-            sent_at = self._write_req_sent_at.pop(req_id, None)
-            if sent_at is not None:
-                logger.info(
-                    "NIXL perf write_req_done req=%s recv_wait_ms=%.3f",
-                    req_id,
-                    (time.perf_counter() - sent_at) * 1000,
-                )
         return done_recving
 
     def _logical_to_kernel_block_ids(self, block_ids: BlockIds) -> BlockIds:
