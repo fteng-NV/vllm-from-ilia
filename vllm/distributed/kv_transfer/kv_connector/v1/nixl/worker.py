@@ -5,6 +5,9 @@
 import logging
 import os
 import queue
+import re
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -31,6 +34,8 @@ from vllm.distributed.kv_transfer.kv_connector.utils import (
 from vllm.distributed.kv_transfer.kv_connector.v1.base import CopyBlocksOp
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    DEFAULT_KV_LEASE_DURATION_S,
+    DEFAULT_PENDING_XFER_TIMEOUT_S,
     GET_META_MSG,
     WRITE_DONE_MSG_PREFIX,
     WRITE_REQ_MSG_PREFIX,
@@ -85,6 +90,7 @@ logger = init_logger(__name__)
 
 WRITE_REQ_BATCH_MSG_PREFIX = b"write_req_batch:"
 WRITE_DONE_BATCH_MSG_PREFIX = b"write_done_batch:"
+WRITE_FAIL_MSG_PREFIX = b"write_fail:"
 
 
 class NixlConnectorWorker:
@@ -221,7 +227,7 @@ class NixlConnectorWorker:
             "backends", ["UCX"]
         )
         kv_lease_duration: int = vllm_config.kv_transfer_config.get_from_extra_config(
-            "kv_lease_duration", 30
+            "kv_lease_duration", DEFAULT_KV_LEASE_DURATION_S
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
         self._lease_extension = kv_lease_duration * 2 // 3
@@ -273,6 +279,15 @@ class NixlConnectorWorker:
             mamba_ssm_size = self._conv_decomp.ssm_sizes
         self._mamba_ssm_size = mamba_ssm_size
 
+        # Metadata.
+        self.engine_id: EngineId = engine_id
+        self.tp_rank = get_tensor_model_parallel_rank()
+        self.world_size = get_tensor_model_parallel_world_size()
+
+        self.num_blocks = kv_cache_config.num_blocks
+        self.enable_permute_local_kv = False
+        self.enable_heterogeneous_attn_post_process = False
+
         # Agent.
         non_ucx_backends = [b for b in self.nixl_backends if b != "UCX"]
         # Configure NIXL num_threads to avoid UAR exhaustion on Mellanox NICs.
@@ -284,28 +299,46 @@ class NixlConnectorWorker:
         num_threads = vllm_config.kv_transfer_config.get_from_extra_config(
             "num_threads", 4
         )
+        device_list = self._resolve_nixl_device_list()
         if nixl_agent_config is None:
             config = None
         else:
             # Enable telemetry by default for NIXL 0.7.1 and above.
-            config = (
+            """ config = (
                 nixl_agent_config(backends=self.nixl_backends, capture_telemetry=True)
                 if len(non_ucx_backends) > 0
                 else nixl_agent_config(num_threads=0, capture_telemetry=True)
-            )
+            ) """
+            if len(non_ucx_backends) > 0:
+                config_kwargs: dict[str, Any] = {
+                    "backends": self.nixl_backends,
+                    "capture_telemetry": True,
+                }
+            else:
+                config_kwargs = {
+                    "num_threads": num_threads,
+                    "capture_telemetry": True,
+                }
+
+            if device_list:
+                config_kwargs["device_list"] = device_list
+
+            try:
+                config = nixl_agent_config(**config_kwargs)
+            except TypeError as e:
+                if "device_list" not in str(e) or "device_list" not in config_kwargs:
+                    raise
+                logger.warning(
+                    "NIXL agent config does not accept device_list, "
+                    "falling back without device_list: %s",
+                    e,
+                )
+                config_kwargs.pop("device_list", None)
+                config = nixl_agent_config(**config_kwargs)
 
         self.nixl_wrapper = nixl_wrapper_cls(str(uuid.uuid4()), config)
         # Map of engine_id -> {rank0: agent_name0, rank1: agent_name1..}.
         self._remote_agents: dict[EngineId, dict[int, str]] = defaultdict(dict)
-
-        # Metadata.
-        self.engine_id: EngineId = engine_id
-        self.tp_rank = get_tensor_model_parallel_rank()
-        self.world_size = get_tensor_model_parallel_world_size()
-
-        self.num_blocks = kv_cache_config.num_blocks
-        self.enable_permute_local_kv = False
-        self.enable_heterogeneous_attn_post_process = False
 
         # KV Caches and nixl tracking data.
         self.device_type = current_platform.device_type
@@ -509,7 +542,312 @@ class NixlConnectorWorker:
         self._pending_xfer_payloads: list[dict[str, Any]] = []
         self._prefill_blocks_lock = threading.Lock()
         # Drop a buffered write request whose prefill never materializes.
-        self._pending_xfer_timeout_ms: float = 30000.0
+        self._pending_xfer_timeout_ms: float = DEFAULT_PENDING_XFER_TIMEOUT_S * 1000.0
+
+    def _resolve_nixl_device_list(self) -> str | None:
+        if "UCX" not in self.nixl_backends:
+            return None
+
+        ucx_net_devices = os.environ.get("UCX_NET_DEVICES")
+        if ucx_net_devices:
+            logger.info("NIXL detected UCX_NET_DEVICES=%s", ucx_net_devices)
+
+        enable_auto = bool(
+            self.kv_transfer_config.get_from_extra_config("auto_device_list", True)
+        )
+        if not enable_auto:
+            return None
+
+        nic = self._pick_nearest_nic_for_current_rank()
+        if nic is None:
+            return None
+        logger.info(
+            "NIXL auto-selected UCX device_list=%s for tp_rank=%s",
+            nic,
+            self.tp_rank,
+        )
+        return nic
+
+    def _pick_nearest_nic_for_current_rank(self) -> str | None:
+        if not torch.cuda.is_available():
+            return None
+        physical_gpu_idx = self._get_physical_gpu_index()
+        if physical_gpu_idx is None:
+            return None
+        nic = self._pick_nic_from_nvidia_topo(physical_gpu_idx)
+        if nic is not None:
+            return nic
+        return self._pick_nic_from_numa(physical_gpu_idx)
+
+    @staticmethod
+    def _get_physical_gpu_index() -> int | None:
+        try:
+            local_gpu_idx = int(torch.cuda.current_device())
+        except Exception:
+            return None
+
+        cvd = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if not cvd:
+            return local_gpu_idx
+
+        visible = [token.strip() for token in cvd.split(",") if token.strip()]
+        if local_gpu_idx >= len(visible):
+            return None
+
+        mapped = visible[local_gpu_idx]
+        # CUDA_VISIBLE_DEVICES may contain UUIDs; in this case we cannot map it
+        # to `nvidia-smi topo -m` matrix rows reliably.
+        if not mapped.isdigit():
+            return None
+        logger.info(
+            "NIXL physical GPU index selected for CUDA_VISIBLE_DEVICES=%s: %s",
+            cvd,
+            mapped,
+        )
+        return int(mapped)
+
+    @staticmethod
+    def _run_command(args: list[str]) -> str | None:
+        try:
+            return subprocess.check_output(args, text=True, stderr=subprocess.DEVNULL)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _pick_nic_from_nvidia_topo(physical_gpu_idx: int) -> str | None:
+        topo_output = NixlConnectorWorker._run_command(["nvidia-smi", "topo", "-m"])
+        if not topo_output:
+            logger.info(
+                "NIXL topo NIC selection skipped: no output from nvidia-smi topo -m "
+                "for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        raw_lines = [line.rstrip() for line in topo_output.splitlines() if line.strip()]
+        if not raw_lines:
+            logger.info(
+                "NIXL topo NIC selection skipped: empty topo output for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        # Split output into: matrix + Legend + NIC Legend.
+        legend_idx = next(
+            (i for i, line in enumerate(raw_lines) if line.startswith("Legend:")), -1
+        )
+        nic_legend_idx = next(
+            (i for i, line in enumerate(raw_lines) if line.startswith("NIC Legend:")),
+            -1,
+        )
+        matrix_end = len(raw_lines)
+        if legend_idx >= 0:
+            matrix_end = min(matrix_end, legend_idx)
+        if nic_legend_idx >= 0:
+            matrix_end = min(matrix_end, nic_legend_idx)
+        matrix_lines = raw_lines[:matrix_end]
+        if not matrix_lines:
+            logger.info(
+                "NIXL topo NIC selection skipped: topology matrix not found for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        # Step1: build NIC alias->device mapping from NIC Legend section.
+        nic_alias_to_name: dict[str, str] = {}
+        if nic_legend_idx >= 0:
+            for line in raw_lines[nic_legend_idx + 1 :]:
+                match = re.match(r"^\s*(NIC\d+)\s*:\s*((?:mlx|ib)\S+)\s*$", line)
+                if match:
+                    nic_alias_to_name[match.group(1)] = match.group(2)
+        if not nic_alias_to_name:
+            logger.info(
+                "NIXL topo NIC selection skipped: NIC Legend mapping not found for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        # Step2: distance priority from Legend section (fallback to default).
+        proximity_rank = {"PIX": 0, "PXB": 1, "PHB": 2, "NODE": 3, "SYS": 4}
+        if legend_idx >= 0:
+            legend_tokens = []
+            legend_end = nic_legend_idx if nic_legend_idx > legend_idx else len(raw_lines)
+            for line in raw_lines[legend_idx + 1 : legend_end]:
+                match = re.match(r"^\s*([A-Z#]+)\s*=", line)
+                if match:
+                    legend_tokens.append(match.group(1))
+            # Keep only known distance tokens while preserving preferred order.
+            ordered_known = [t for t in ("PIX", "PXB", "PHB", "NODE", "SYS") if t in legend_tokens]
+            if ordered_known:
+                proximity_rank = {token: rank for rank, token in enumerate(ordered_known)}
+
+        # Step3: parse matrix into a 2D table and pick best NIC for row GPUx.
+        split_pattern = re.compile(r"\t+|\s{2,}")
+        header: list[str] | None = None
+        for line in matrix_lines:
+            cells = split_pattern.split(line.strip())
+            if "CPU Affinity" in line and any(cell.startswith("GPU") for cell in cells):
+                header = cells
+                break
+        if header is None:
+            logger.info(
+                "NIXL topo NIC selection skipped: cannot parse matrix header for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        row_prefix = f"GPU{physical_gpu_idx}"
+        row: list[str] | None = None
+        for line in matrix_lines[1:]:
+            cells = split_pattern.split(line.strip())
+            if cells and cells[0] == row_prefix:
+                row = cells
+                break
+        if row is None:
+            logger.info("NIXL topo NIC selection skipped: row %s not found", row_prefix)
+            return None
+
+        nic_cols = [(idx, name) for idx, name in enumerate(header) if name.startswith("NIC")]
+        if not nic_cols:
+            logger.info(
+                "NIXL topo NIC selection skipped: no NIC columns in header for GPU%s "
+                "(header=%s)",
+                physical_gpu_idx,
+                header,
+            )
+            return None
+
+        row_offset = 1 if len(row) == len(header) + 1 else 0
+        best: tuple[int, str, str] | None = None
+        candidates: list[str] = []
+        for header_idx, nic_alias in nic_cols:
+            row_idx = header_idx + row_offset
+            if row_idx >= len(row):
+                continue
+            distance = row[row_idx].strip()
+            score = proximity_rank.get(distance)
+            if score is None:
+                continue
+            nic_name = nic_alias_to_name.get(nic_alias)
+            if nic_name is None:
+                continue
+            candidates.append(f"{nic_alias}->{nic_name}:{distance}")
+            candidate = (score, nic_name, distance)
+            if best is None or candidate < best:
+                best = candidate
+        if best is None:
+            logger.info(
+                "NIXL topo NIC selection found no valid candidate for GPU%s; "
+                "raw candidates=%s",
+                physical_gpu_idx,
+                candidates,
+            )
+            return None
+        logger.info(
+            "NIXL topo NIC selected for GPU%s: nic=%s link=%s candidates=%s",
+            physical_gpu_idx,
+            best[1],
+            best[2],
+            candidates,
+        )
+        return best[1]
+
+    @staticmethod
+    def _pick_nic_from_numa(physical_gpu_idx: int) -> str | None:
+        query = NixlConnectorWorker._run_command(
+            [
+                "nvidia-smi",
+                "--query-gpu=pci.bus_id",
+                "--format=csv,noheader",
+            ]
+        )
+        if not query:
+            logger.info(
+                "NIXL NUMA NIC selection skipped: cannot query GPU bus ids for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+        bus_ids = [line.strip() for line in query.splitlines() if line.strip()]
+        if physical_gpu_idx >= len(bus_ids):
+            logger.info(
+                "NIXL NUMA NIC selection skipped: GPU%s out of range (num_gpus=%s)",
+                physical_gpu_idx,
+                len(bus_ids),
+            )
+            return None
+        gpu_bus_id = bus_ids[physical_gpu_idx].lower()
+
+        gpu_numa = None
+        gpu_candidates = [gpu_bus_id]
+        if len(gpu_bus_id) >= 12:
+            gpu_candidates.append(gpu_bus_id[-12:])
+        for bus_id in gpu_candidates:
+            numa_path = f"/sys/bus/pci/devices/{bus_id}/numa_node"
+            try:
+                with open(numa_path, encoding="utf-8") as f:
+                    gpu_numa = int(f.read().strip())
+                    break
+            except Exception:
+                continue
+        if gpu_numa is None:
+            logger.info(
+                "NIXL NUMA NIC selection skipped: cannot resolve GPU%s numa node "
+                "(bus candidates=%s)",
+                physical_gpu_idx,
+                gpu_candidates,
+            )
+            return None
+
+        try:
+            ib_devs = sorted(os.listdir("/sys/class/infiniband"))
+        except Exception:
+            logger.info(
+                "NIXL NUMA NIC selection skipped: cannot list infiniband devices "
+                "for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+        if not ib_devs:
+            logger.info(
+                "NIXL NUMA NIC selection skipped: no infiniband devices for GPU%s",
+                physical_gpu_idx,
+            )
+            return None
+
+        best_same_numa: str | None = None
+        fallback: str | None = None
+        nic_candidates: list[str] = []
+        for dev in ib_devs:
+            numa_path = f"/sys/class/infiniband/{dev}/device/numa_node"
+            try:
+                with open(numa_path, encoding="utf-8") as f:
+                    nic_numa = int(f.read().strip())
+            except Exception:
+                continue
+            nic_candidates.append(f"{dev}:numa{nic_numa}")
+            if fallback is None:
+                fallback = dev
+            if nic_numa == gpu_numa:
+                best_same_numa = dev
+                break
+        chosen = best_same_numa or fallback
+        if chosen is None:
+            logger.info(
+                "NIXL NUMA NIC selection found no candidate for GPU%s (gpu_numa=%s)",
+                physical_gpu_idx,
+                gpu_numa,
+            )
+            return None
+        logger.info(
+            "NIXL NUMA NIC selected for GPU%s: nic=%s reason=%s gpu_numa=%s "
+            "candidates=%s",
+            physical_gpu_idx,
+            chosen,
+            "same-numa" if best_same_numa is not None else "fallback-first",
+            gpu_numa,
+            nic_candidates,
+        )
+        return chosen
 
     def _sync_block_size_with_kernel(self) -> None:
         backends = get_current_attn_backends(self.vllm_config)
@@ -2185,6 +2523,16 @@ class NixlConnectorWorker:
                     self._done_recving_from_background.add(req_id)
             return True
 
+        if notif.startswith(WRITE_FAIL_MSG_PREFIX):
+            if not self.kv_transfer_config.is_kv_consumer:
+                logger.warning(
+                    "Unexpected write_fail on producer rank %s", self.tp_rank
+                )
+                return True
+            req_id = notif[len(WRITE_FAIL_MSG_PREFIX) :].decode("utf-8")
+            self._handle_failed_transfer(req_id, None)
+            return True
+
         return False
 
     def _poll_write_req_loop(self) -> None:
@@ -2307,6 +2655,7 @@ class NixlConnectorWorker:
                     payload.get("decode_req_id"),
                     held_ms,
                 )
+                self._notify_decode_write_failed(payload)
             else:
                 still_pending.append(payload)
 
@@ -2742,6 +3091,56 @@ class NixlConnectorWorker:
             return True, None, polls
         finally:
             self.nixl_wrapper.release_xfer_handle(handle)
+
+    def _notify_decode_write_failed(self, payload: dict[str, Any]) -> None:
+        """Tell D that a buffered parallel-path write will never be served."""
+        decode_req_id = payload.get("decode_req_id")
+        decode_engine_id = payload.get("decode_engine_id")
+        decode_tp_rank = payload.get("decode_tp_rank")
+        if (
+            decode_req_id is None
+            or decode_engine_id is None
+            or decode_tp_rank is None
+        ):
+            logger.warning(
+                "Cannot notify decode of dropped write for transfer_id=%s: "
+                "missing decode routing fields",
+                payload.get("transfer_id"),
+            )
+            return
+        self._send_write_fail_notif(
+            decode_engine_id, int(decode_tp_rank), str(decode_req_id)
+        )
+
+    def _send_write_fail_notif(
+        self, decode_engine_id: EngineId, decode_tp_rank: int, decode_req_id: ReqId
+    ) -> None:
+        agent_name = self._remote_agents.get(decode_engine_id, {}).get(
+            decode_tp_rank
+        )
+        if agent_name is None:
+            logger.warning(
+                "Cannot notify decode of write failure for %s: "
+                "no agent for engine %s tp_rank %s",
+                decode_req_id,
+                decode_engine_id,
+                decode_tp_rank,
+            )
+            return
+        try:
+            self.nixl_wrapper.send_notif(
+                agent_name,
+                notif_msg=WRITE_FAIL_MSG_PREFIX + decode_req_id.encode("utf-8"),
+            )
+        except Exception as e:
+            self._log_failure(
+                failure_type="write_fail_notif_failed",
+                req_id=decode_req_id,
+                error=e,
+                dst_engine_id=decode_engine_id,
+                decode_tp_rank=decode_tp_rank,
+            )
+            self.xfer_stats.record_failed_notification()
 
     def _send_write_done_notif(
         self, decode_engine_id: EngineId, decode_tp_rank: int, decode_req_id: ReqId

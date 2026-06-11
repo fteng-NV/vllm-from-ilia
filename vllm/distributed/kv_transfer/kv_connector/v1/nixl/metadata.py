@@ -18,6 +18,11 @@ logger = init_logger(__name__)
 TransferHandle = int
 ReqId = str
 
+# Aligned with Mooncake's default VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT (480s).
+# Used for prefiller KV block leases and parallel-proxy write buffering.
+DEFAULT_KV_LEASE_DURATION_S = 480
+DEFAULT_PENDING_XFER_TIMEOUT_S = 480
+
 GET_META_MSG = b"get_meta_msg"
 WRITE_REQ_MSG_PREFIX = b"write_req:"
 WRITE_DONE_MSG_PREFIX = b"write_done:"

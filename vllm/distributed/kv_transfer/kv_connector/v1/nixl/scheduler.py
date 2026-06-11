@@ -20,6 +20,7 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.nixl.metadata import (
+    DEFAULT_KV_LEASE_DURATION_S,
     GET_META_MSG,
     HeartbeatInfo,
     NixlConnectorMetadata,
@@ -69,7 +70,7 @@ class NixlConnectorScheduler:
         assert vllm_config.kv_transfer_config is not None
         self._kv_lease_duration: int = (
             vllm_config.kv_transfer_config.get_from_extra_config(
-                "kv_lease_duration", 30
+                "kv_lease_duration", DEFAULT_KV_LEASE_DURATION_S
             )
         )
         # NOTE (NickLucche): For now we use a hardcoded value for a simpler interface.
