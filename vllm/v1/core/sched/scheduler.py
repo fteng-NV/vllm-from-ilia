@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
+import os
 import time
 from collections import defaultdict, deque
 from collections.abc import Iterable
@@ -23,6 +24,9 @@ from vllm.distributed.kv_transfer.kv_connector.v1 import (
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.base import KVConnectorMetadata
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.write_stats import (
+    SchedAdmissionStats,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
     RoutedExpertsManager,
@@ -275,6 +279,26 @@ class Scheduler(SchedulerInterface):
             self._re_block_ids: dict[str, list[int]] = {}
 
         self._pause_state: PauseState = PauseState.UNPAUSED
+
+        # Optional per-step admission instrumentation (default off). Env-gated
+        # because the core scheduler does not see kv_connector_extra_config.
+        # Measures how many fresh requests are admitted per step (split signal)
+        # and the inter-arrival gap (proxy/dispatch staggering). See
+        # SchedAdmissionStats. Interval via VLLM_SCHED_ADMISSION_INTERVAL_S.
+        self._admit_stats: SchedAdmissionStats | None = None
+        if os.environ.get("VLLM_SCHED_ADMISSION_STATS", "0") not in ("0", "", "false"):
+            _kvc = self.vllm_config.kv_transfer_config
+            _role = "P" if (_kvc is not None and _kvc.is_kv_producer) else "D"
+            self._admit_stats = SchedAdmissionStats(
+                logger,
+                tag=f" role={_role}",
+                interval_s=float(
+                    os.environ.get("VLLM_SCHED_ADMISSION_INTERVAL_S", "5")
+                ),
+                gap_max_ms=float(
+                    os.environ.get("VLLM_SCHED_ADMISSION_GAP_MAX_MS", "500")
+                ),
+            )
 
     def _mamba_block_aligned_split(
         self,
@@ -907,8 +931,13 @@ class Scheduler(SchedulerInterface):
         # 2. Wrap up all the KV cache load / save ops into an opaque object
         # 3. Clear the internal states of the connector
         if self.connector is not None:
+            _bm0 = time.perf_counter() if self._admit_stats is not None else 0.0
             meta = self._build_kv_connector_meta(self.connector, scheduler_output)
             scheduler_output.kv_connector_metadata = meta
+            if self._admit_stats is not None:
+                self._admit_stats.record_build_meta_ms(
+                    (time.perf_counter() - _bm0) * 1000.0
+                )
 
         # Build the connector meta for ECConnector
         if self.ec_connector is not None:
@@ -919,6 +948,12 @@ class Scheduler(SchedulerInterface):
 
         with record_function_or_nullcontext("schedule: update_after_schedule"):
             self._update_after_schedule(scheduler_output)
+        if self._admit_stats is not None:
+            # Per-step admission: how many fresh reqs entered this step (split
+            # signal). scheduled_new_reqs holds the requests admitted from the
+            # WAITING queue this step.
+            self._admit_stats.record_admission(len(scheduled_new_reqs))
+            self._admit_stats.maybe_dump()
         return scheduler_output
 
     def _build_kv_connector_meta(
@@ -1753,6 +1788,12 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting) + len(self.skipped_waiting)
 
     def add_request(self, request: Request) -> None:
+        _t0 = time.perf_counter() if self._admit_stats is not None else 0.0
+        _on_new_ms = 0.0
+        if self._admit_stats is not None:
+            # Record inter-arrival gap (proxy/dispatch staggering signal) +
+            # arrival_time probe (frontend ingress gap vs engine pickup gap).
+            self._admit_stats.record_arrival(request.arrival_time)
         existing = self.requests.get(request.request_id)
         if existing is not None:
             update = StreamingUpdate.from_request(request)
@@ -1772,9 +1813,16 @@ class Scheduler(SchedulerInterface):
             self._enqueue_waiting_request(request)
             self.requests[request.request_id] = request
             if self.connector is not None:
+                _tc0 = time.perf_counter()
                 self.connector.on_new_request(request)
+                _on_new_ms = (time.perf_counter() - _tc0) * 1000.0
             if self.log_stats:
                 request.record_event(EngineCoreEventType.QUEUED)
+        if self._admit_stats is not None:
+            # add_req probe: full add_request duration + on_new_request portion.
+            self._admit_stats.record_add_timing(
+                (time.perf_counter() - _t0) * 1000.0, _on_new_ms
+            )
 
     def finish_requests(
         self, request_ids: str | Iterable[str] | None, finished_status: RequestStatus

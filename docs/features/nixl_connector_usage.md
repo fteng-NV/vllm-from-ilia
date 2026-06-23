@@ -127,7 +127,7 @@ python tests/v1/kv_connector/nixl_integration/toy_proxy_server.py \
     - Connection info is passed via KVTransferParams from prefiller to decoder for handshake
 
 - `kv_lease_duration` (via `kv_connector_extra_config`): Lease duration (in seconds) for the prefiller's KV cache blocks. (Optional)
-    - Default: 30
+    - Default: 480
     - When a prefill request finishes, its KV blocks are held for this duration waiting for the decoder to read them. While the request is queued on the decoder, periodic heartbeats automatically extend the lease. If neither a heartbeat nor a read notification arrives before the lease expires, the blocks are freed. The heartbeat interval and extension amount are derived automatically from this value.
     - Example: `--kv-transfer-config '{"kv_connector_extra_config": {"kv_lease_duration": 60}}'`
 
@@ -298,7 +298,7 @@ curl http://localhost:8000/v1/chat/completions \
     case transfers cache computed for the wrong token positions, producing
     incorrect results.
 
-    We currently assume the router is able to detect such mismatch across turns. See [#43094](https://github.com/vllm-project/vllm/issues/43094). 
+    We currently assume the router is able to detect such mismatch across turns. See [#43094](https://github.com/vllm-project/vllm/issues/43094).
 
 ## Multi-Instance Setup
 

@@ -32,6 +32,10 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     SupportsHMA,
 )
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import KVConnectorStats
+from vllm.distributed.kv_transfer.kv_connector.v1.write_stats import (
+    RecvPathStats,
+    WritePathStats,
+)
 from vllm.distributed.kv_transfer.kv_connector.v1.mooncake.mooncake_utils import (
     MooncakeBootstrapServer,
     RegisterWorkerPayload,
@@ -780,6 +784,39 @@ class MooncakeConnectorWorker:
         self.engine_id: EngineId = engine_id
         self.tp_rank = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
+        self._write_stats = (
+            WritePathStats(
+                logger,
+                name="mc-wstats",
+                tag=f" rank={self.tp_rank}",
+                interval_s=float(
+                    kv_transfer_config.kv_connector_extra_config.get(
+                        "write_stats_interval_s", 5.0
+                    )
+                ),
+            )
+            if kv_transfer_config.kv_connector_extra_config.get("write_stats", False)
+            else None
+        )
+        # Optional D-side RECV-path instrumentation (default off, same switch).
+        # All three timestamps (t_start/t_known/t_report) are taken on the single
+        # receiver asyncio loop, so no lock is needed.
+        self._recv_stats = (
+            RecvPathStats(
+                logger,
+                name="mc-recv",
+                tag=f" rank={self.tp_rank}",
+                interval_s=float(
+                    kv_transfer_config.kv_connector_extra_config.get(
+                        "write_stats_interval_s", 5.0
+                    )
+                ),
+            )
+            if kv_transfer_config.kv_connector_extra_config.get("write_stats", False)
+            else None
+        )
+        self._recv_t_start: dict[ReqId, float] = {}
+        self._recv_t_known: dict[ReqId, float] = {}
         self.num_blocks = 0
         self.block_len_per_layer: list[int] = []
         self.seen_base_addresses: list[int] = []
@@ -814,7 +851,7 @@ class MooncakeConnectorWorker:
                 self.num_sender_workers,
             )
             # An asyncio queue to buffer incoming requests for the sender
-            self.sender_worker_queue = asyncio.Queue[tuple[bytes, bytes]]()
+            self.sender_worker_queue = asyncio.Queue[tuple[bytes, bytes, float]]()
             self.sender_loop = asyncio.new_event_loop()
             # Background thread for processing new sending requests.
             self._sender_listener_t = threading.Thread(
@@ -966,7 +1003,9 @@ class MooncakeConnectorWorker:
         try:
             while True:
                 identity, metadata_bytes = await sock.recv_multipart()
-                await self.sender_worker_queue.put((identity, metadata_bytes))
+                await self.sender_worker_queue.put(
+                    (identity, metadata_bytes, time.perf_counter())
+                )
         except zmq.ContextTerminated:
             logger.debug("ZMQ context terminated, exiting Mooncake sender thread.")
         except Exception as e:
@@ -981,10 +1020,17 @@ class MooncakeConnectorWorker:
     async def _sender_worker(self, sock: zmq.asyncio.Socket):
         while True:
             try:
-                identity, metadata_bytes = await self.sender_worker_queue.get()
+                identity, metadata_bytes, t_enqueue = (
+                    await self.sender_worker_queue.get()
+                )
+                queue_wait_ms = (time.perf_counter() - t_enqueue) * 1000.0
                 try:
                     metadata = self._xfer_meta_decoder.decode(metadata_bytes)
-                    await self.send_kv_to_decode(identity, sock, metadata)
+                    await self.send_kv_to_decode(
+                        identity, sock, metadata, queue_wait_ms
+                    )
+                    if self._write_stats is not None:
+                        self._write_stats.maybe_dump()
                 except Exception as e:
                     logger.error("Error processing Mooncake xfer request: %s", e)
                     error_response = MooncakeXferResponse(
@@ -1001,7 +1047,11 @@ class MooncakeConnectorWorker:
                 logger.error("Error in _sender_worker: %s", e)
 
     async def send_kv_to_decode(
-        self, identity: bytes, sock: zmq.asyncio.Socket, meta: MooncakeXferMetadata
+        self,
+        identity: bytes,
+        sock: zmq.asyncio.Socket,
+        meta: MooncakeXferMetadata,
+        queue_wait_ms: float = 0.0,
     ):
         pending_reqs: dict[ReqId, SendBlockMeta] = {}
         remote_tp_ranks = self.transfer_topo.handshake_target_ranks(meta.remote_tp_size)
@@ -1053,9 +1103,11 @@ class MooncakeConnectorWorker:
 
         async def wait_and_ret(
             d_req_id: ReqId, send_meta: SendBlockMeta
-        ) -> tuple[ReqId, SendBlockMeta]:
+        ) -> tuple[ReqId, SendBlockMeta, float]:
+            t0 = time.perf_counter()
             await send_meta.ready.wait()
-            return d_req_id, send_meta
+            pending_ms = (time.perf_counter() - t0) * 1000.0
+            return d_req_id, send_meta, pending_ms
 
         wait_tasks = [
             asyncio.create_task(wait_and_ret(d_req_id, send_meta))
@@ -1091,8 +1143,10 @@ class MooncakeConnectorWorker:
                 else MooncakeXferResponseStatus.FINISH
             )
             ready_reqs: list[tuple[ReqId, SendBlockMeta]] = []
+            pending_this: dict[ReqId, float] = {}
             for task in done:
-                d_req_id, send_meta = task.result()
+                d_req_id, send_meta, pending_ms = task.result()
+                pending_this[d_req_id] = pending_ms
                 del pending_reqs[d_req_id]
                 # Do we still in reqs_need_send (not expired)?
                 if send_meta.transfer_id in self.reqs_need_send:
@@ -1107,6 +1161,7 @@ class MooncakeConnectorWorker:
                         "Request %s expired before sending on P side.", d_req_id
                     )
 
+            _t_prep = time.perf_counter()
             (
                 src_ptrs,
                 dst_ptrs,
@@ -1119,6 +1174,8 @@ class MooncakeConnectorWorker:
                 local_regions,
                 remote_regions,
             )
+            prepare_ms = (time.perf_counter() - _t_prep) * 1000.0
+            xfer_ms_val: float | None = None
             err_req_set = set(err_reqs)
             ok_ready_reqs = [
                 (d_req_id, send_meta)
@@ -1128,7 +1185,7 @@ class MooncakeConnectorWorker:
 
             if src_ptrs:
                 remote_session = f"{meta.remote_hostname}:{meta.remote_port}"
-                ret_value = await self.sender_loop.run_in_executor(
+                ret_value, xfer_ms_val = await self.sender_loop.run_in_executor(
                     self._sender_executor,
                     self._send_blocks,
                     remote_session,
@@ -1162,6 +1219,15 @@ class MooncakeConnectorWorker:
                     and self.reqs_need_send.pop(send_meta.transfer_id, None) is not None
                 ):
                     self.finished_sending_reqs.add(send_meta.p_req_id)
+
+                if self._write_stats is not None:
+                    self._write_stats.record(
+                        pending_ms=pending_this.get(d_req_id, 0.0),
+                        wait_ms=queue_wait_ms,
+                        prepare_ms=prepare_ms,
+                        xfer_ms=xfer_ms_val,
+                        batch_size=len(ok_ready_reqs),
+                    )
 
             response = MooncakeXferResponse(
                 status=response_status,
@@ -1360,7 +1426,9 @@ class MooncakeConnectorWorker:
         src_ptrs: list[int],
         dst_ptrs: list[int],
         lengths: list[int],
-    ) -> int:
+    ) -> tuple[int, float]:
+        # Returns (ret_value, xfer_ms) where xfer_ms is the pure transport time
+        # of batch_transfer_sync_write (comparable to NIXL telemetry xferDuration).
         start_time = time.perf_counter()
         ret_value = self.engine.batch_transfer_sync_write(
             remote_session, src_ptrs, dst_ptrs, lengths
@@ -1383,7 +1451,7 @@ class MooncakeConnectorWorker:
                 len(src_ptrs),
                 sum(lengths),
             )
-        return ret_value
+        return ret_value, duration * 1000.0
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Register the KV Cache data in mooncake."""
@@ -1460,6 +1528,24 @@ class MooncakeConnectorWorker:
     async def fetch_finished_recving_reqs(self) -> set[ReqId]:
         finished_recving_reqs = self.finished_recving_reqs
         self.finished_recving_reqs = set()
+        # RECV instrumentation: t_report = now (req surfaced to engine via
+        # get_finished). Record the 3 stages per req and drop its timestamps.
+        # Same thread (receiver loop) as t_start/t_known, so no lock needed.
+        if self._recv_stats is not None and finished_recving_reqs:
+            t_report = time.perf_counter()
+            for req_id in finished_recving_reqs:
+                t_start = self._recv_t_start.pop(req_id, None)
+                t_known = self._recv_t_known.pop(req_id, None)
+                if t_start is None:
+                    continue
+                if t_known is None:
+                    t_known = t_report
+                self._recv_stats.record(
+                    recv_wait_ms=(t_known - t_start) * 1000.0,
+                    report_lag_ms=(t_report - t_known) * 1000.0,
+                    recv_total_ms=(t_report - t_start) * 1000.0,
+                )
+            self._recv_stats.maybe_dump()
         return finished_recving_reqs
 
     async def fetch_finished_sending_reqs(self) -> set[ReqId]:
@@ -1601,6 +1687,11 @@ class MooncakeConnectorWorker:
             pull_meta.pull_tasks_count -= 1
             if pull_meta.pull_tasks_count == 0:
                 self.finished_recving_reqs.add(pull_meta.d_req_id)
+                if self._recv_stats is not None:
+                    # t_known: all P TP ranks have written this req's KV.
+                    self._recv_t_known.setdefault(
+                        pull_meta.d_req_id, time.perf_counter()
+                    )
 
         if ok_reqs:
             logger.debug("pulling kv_caches for %s finished", ok_reqs)
@@ -1656,6 +1747,12 @@ class MooncakeConnectorWorker:
         )
         for pull_meta in pull_metas.values():
             pull_meta.pull_tasks_count = count
+            if self._recv_stats is not None:
+                # t_start: D commits to receiving this req (on the receiver loop,
+                # right when start_load_kv reaches the worker). First time only.
+                self._recv_t_start.setdefault(
+                    pull_meta.d_req_id, time.perf_counter()
+                )
         for remote_tp_rank in remote_tp_ranks:
             worker_addr = self._remote_agents[remote_engine_id][remote_tp_rank][0]
             asyncio.create_task(

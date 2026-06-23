@@ -905,6 +905,20 @@ class EngineCoreProc(EngineCore):
 
             self.addresses = addresses
             self.process_input_queue_block = True
+            # Optional admission-coalesce window (ms; default 0 = off). When
+            # the engine wakes from idle and admits the FIRST request of a
+            # burst, keep draining the input queue for up to this many ms so
+            # closely-following sibling requests land in the SAME scheduler
+            # step instead of being split across steps (a later request that
+            # misses the step waits ~a full prefill step). Env-gated so it can
+            # be enabled per-instance, e.g. only the NIXL prefiller, whose
+            # request arrivals reach add_request ~2ms apart vs Mooncake ~0.1ms.
+            try:
+                self._coalesce_ms = float(
+                    os.environ.get("VLLM_ENGINE_COALESCE_MS", "0")
+                )
+            except ValueError:
+                self._coalesce_ms = 0.0
             if envs.VLLM_ELASTIC_EP_SCALE_UP_LAUNCH:
                 self._eep_send_engine_core_notification(
                     EEPNotificationType.NEW_CORE_ENGINES_INIT_READY,
@@ -1213,6 +1227,12 @@ class EngineCoreProc(EngineCore):
     def _process_input_queue(self):
         """Exits when an engine step needs to be performed."""
 
+        # Whether we entered this call idle (no work). Only then do we apply
+        # the admission-coalesce window below: under sustained load has_work()
+        # is already True, so coalescing never triggers and latency is
+        # unaffected.
+        was_idle = not self.has_work()
+
         waited = False
         while not self.has_work() and self.is_running():
             # Notify callbacks waiting for engine to become idle.
@@ -1241,11 +1261,31 @@ class EngineCoreProc(EngineCore):
             req = self.input_queue.get_nowait()
             self._handle_client_request(*req)
 
+        # Admission-coalesce: if we just woke from idle and admitted the first
+        # request(s) of a burst, keep draining for up to _coalesce_ms so any
+        # sibling requests still in flight are admitted in the SAME scheduler
+        # step (drains whatever arrives within the window, regardless of count).
+        if was_idle and self._coalesce_ms > 0.0 and self.has_work():
+            deadline = time.perf_counter() + self._coalesce_ms / 1000.0
+            while time.perf_counter() < deadline:
+                try:
+                    req = self.input_queue.get(timeout=0.0005)
+                except queue.Empty:
+                    continue
+                self._handle_client_request(*req)
+
     def _process_engine_step(self) -> bool:
         """Called only when there are unfinished local requests."""
 
-        # Step the engine core.
+        # Step the engine core. Time step_fn() (the per-step busy window:
+        # schedule + execute dispatch + waiting for worker output) for the
+        # admission probe -- a longer step is a bigger window for a burst's 2nd
+        # request to miss this step and be split off.
+        _step_t0 = time.perf_counter()
         outputs, model_executed = self.step_fn()
+        _admit = getattr(self.scheduler, "_admit_stats", None)
+        if _admit is not None:
+            _admit.record_step_ms((time.perf_counter() - _step_t0) * 1000.0)
         # Put EngineCoreOutputs into the output queue.
         for output in outputs.items() if outputs else ():
             self.output_queue.put_nowait(output)

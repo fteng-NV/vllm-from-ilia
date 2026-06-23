@@ -32,7 +32,13 @@ import asyncio
 import itertools
 import logging
 import os
+import time
 import uuid
+
+# Optional proxy dispatch-timing trace (default off): logs when each request is
+# received and when its prefill POST leaves the proxy, so we can tell whether
+# the proxy itself staggers the two prefill requests of a burst.
+_POST_TS = os.environ.get("PROXY_POST_TS", "0") not in ("0", "", "false")
 from contextlib import asynccontextmanager
 
 import httpx
@@ -187,6 +193,11 @@ async def send_request_to_prefill(
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
     }
+    if _POST_TS:
+        print(
+            f"PREFILL_POST_SENT rid={request_id} t_ms={time.perf_counter() * 1000:.3f}",
+            flush=True,
+        )
     response = await client_info["client"].post(endpoint, json=req_data, headers=headers)
     response.raise_for_status()
     await response.aread()
@@ -245,6 +256,11 @@ async def _handle_completions(api: str, request: Request):
         req_data = await request.json()
         request_id = str(uuid.uuid4())
         transfer_id = f"xfer-{request_id}"
+        if _POST_TS:
+            print(
+                f"PROXY_RECV rid={request_id} t_ms={time.perf_counter() * 1000:.3f}",
+                flush=True,
+            )
 
         prefill_client_info = get_next_client(request.app, "prefill")
         decode_client_info = get_next_client(request.app, "decode")
