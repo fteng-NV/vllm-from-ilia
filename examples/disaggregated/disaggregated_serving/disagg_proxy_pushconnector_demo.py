@@ -31,6 +31,7 @@ disagg_proxy_pushconnector_demo.py \
 """
 
 import argparse
+import asyncio
 import contextlib
 import ipaddress
 import itertools
@@ -91,6 +92,7 @@ class PushProxy:
         prefill_side_channel_port: int,
         prefill_tp_size: int,
         prefill_pp_size: int,
+        concurrent_prefill_decode: bool = False,
         custom_create_completion: Callable[[Request], StreamingResponse] | None = None,
         custom_create_chat_completion: Callable[[Request], StreamingResponse]
         | None = None,
@@ -101,6 +103,7 @@ class PushProxy:
         self.decode_cycler = itertools.cycle(decode_instances)
         self.model = model
         self.scheduling_policy = scheduling_policy
+        self.concurrent_prefill_decode = concurrent_prefill_decode
 
         # Push-mode metadata: D needs P's coordinates up-front. Pull mode
         # learns these from P's response; push mode uses CLI args because
@@ -149,12 +152,37 @@ class PushProxy:
 
     # ── HTTP forwarding ─────────────────────────────────────────────── #
 
-    async def forward_request(self, url, data, headers, use_chunked=True):
+    async def forward_request(
+        self, url, data, headers, use_chunked=True, raise_on_4xx=False
+    ):
+        """Forward a request and stream the response body.
+
+        Args:
+            raise_on_4xx: When True, treat 4xx responses as errors and raise
+                HTTPException instead of yielding the body. Use this for
+                prefill (P) requests where a 4xx means the NIXL Write will
+                never happen. Leave False (default) for decode (D) requests
+                where 4xx bodies should be forwarded to the client as-is.
+        """
         async with aiohttp.ClientSession(timeout=AIOHTTP_TIMEOUT) as session:
             try:
                 async with session.post(
                     url=url, json=data, headers=headers
                 ) as response:
+                    if 400 <= response.status < 500 and raise_on_4xx:
+                        error_content = await response.text()
+                        with contextlib.suppress(json.JSONDecodeError):
+                            error_content = json.loads(error_content)
+                        logger.error(
+                            "Request failed with status %s: %s",
+                            response.status,
+                            error_content,
+                        )
+                        raise HTTPException(
+                            status_code=response.status,
+                            detail=f"Request failed with status {response.status}: "
+                            f"{error_content}",
+                        )
                     if 200 <= response.status < 300 or 400 <= response.status < 500:
                         if use_chunked:
                             async for chunk_bytes in response.content.iter_chunked(
@@ -259,8 +287,18 @@ class PushProxy:
         decode_instance = self.schedule(self.decode_cycler)
         headers = self._common_headers(request_id)
 
-        # Fire prefill; we don't read its body but must drain the
-        # connection so the upstream server can free its slot.
+        if self.concurrent_prefill_decode:
+            return await self._push_completion_concurrent(
+                path,
+                prefill_instance,
+                decode_instance,
+                prefill_request,
+                decode_request,
+                headers,
+                request_id,
+            )
+
+        # Sequential mode (default): wait for P's response before firing D.
         async for _ in self.forward_request(
             f"http://{prefill_instance}{path}", prefill_request, headers
         ):
@@ -270,6 +308,112 @@ class PushProxy:
             f"http://{decode_instance}{path}", decode_request, headers
         )
         return StreamingResponse(generator, media_type="application/json")
+
+    async def _push_completion_concurrent(
+        self,
+        path: str,
+        prefill_instance: str,
+        decode_instance: str,
+        prefill_request: dict,
+        decode_request: dict,
+        headers: dict,
+        request_id: str,
+    ) -> StreamingResponse:
+        """Concurrent P+D dispatch with prefill failure propagation.
+
+        ``asyncio.wait`` races P's task against D's first response chunk and
+        handles two failure windows:
+
+        * **P fails before D produces output** (connection refused, mid-prefill
+          crash, etc.): ``p_exc`` is set, D's request is cancelled, and a 502
+          is returned immediately — avoiding a multi-second wait on D's
+          watchdog timeout.
+
+        * **P fails after D has started streaming**: the client already has
+          tokens; no graceful abort is possible. The error is logged and D's
+          stream continues until D's own watchdog fires.
+        """
+        p_exc: list[BaseException] = []
+
+        async def _run_prefill() -> None:
+            try:
+                async for _ in self.forward_request(
+                    f"http://{prefill_instance}{path}",
+                    prefill_request,
+                    headers,
+                    raise_on_4xx=True,
+                ):
+                    pass
+            except Exception as exc:
+                p_exc.append(exc)
+                logger.error(
+                    "Prefill request failed (request_id=%s, instance=%s): %s",
+                    request_id,
+                    prefill_instance,
+                    exc,
+                )
+
+        p_task = asyncio.create_task(_run_prefill())
+
+        # Race P's task against D's first response chunk.
+        d_iter = self.forward_request(
+            f"http://{decode_instance}{path}", decode_request, headers
+        ).__aiter__()
+
+        first_chunk_task: asyncio.Task = asyncio.create_task(
+            d_iter.__anext__()  # type: ignore[arg-type]
+        )
+
+        done, _ = await asyncio.wait(
+            [p_task, first_chunk_task],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+
+        # P failed — abort D regardless of whether D has produced
+        # output yet. We cannot reliably tell whether the NIXL Write succeeded
+        # when P's HTTP request failed, so aborting is the safe choice.
+        if p_exc:
+            first_chunk_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await first_chunk_task
+            raise HTTPException(
+                status_code=502,
+                detail=(
+                    f"Prefill failed, decode aborted "
+                    f"(request_id={request_id}): {p_exc[0]}"
+                ),
+            )
+
+        # D has its first chunk, or P succeeded before D (normal fast-P case).
+        # Stream remaining chunks; clean up p_task on exit.
+        async def _stream_rest() -> ...:
+            try:
+                # Await first_chunk_task: returns immediately if D already has
+                # a chunk ready; waits if P finished before D (normal case).
+                try:
+                    yield await first_chunk_task
+                except StopAsyncIteration:
+                    return
+                # Stream the rest.
+                async for chunk in d_iter:
+                    if p_exc:
+                        # P failed after streaming started — log
+                        # once and continue; client already has partial output.
+                        logger.warning(
+                            "Prefill failed while decode is streaming "
+                            "(request_id=%s): %s — D watchdog will clean up.",
+                            request_id,
+                            p_exc[0],
+                        )
+                        p_exc.clear()  # suppress repeated log per chunk
+                    yield chunk
+            finally:
+                if not p_task.done():
+                    p_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await p_task
+
+        return StreamingResponse(_stream_rest(), media_type="application/json")
 
     async def create_completion(self, raw_request: Request):
         try:
@@ -321,6 +465,7 @@ class PushProxyServer:
             prefill_side_channel_port=args.prefill_side_channel_port,
             prefill_tp_size=args.prefill_tp_size,
             prefill_pp_size=args.prefill_pp_size,
+            concurrent_prefill_decode=args.concurrent_prefill_decode,
             custom_create_completion=create_completion,
             custom_create_chat_completion=create_chat_completion,
         )
@@ -430,6 +575,17 @@ def parse_args():
         type=int,
         default=1,
         help="Pipeline parallel size of the prefill vLLM instance",
+    )
+    parser.add_argument(
+        "--concurrent-prefill-decode",
+        action="store_true",
+        default=False,
+        help=(
+            "Fire prefill (P) and decode (D) requests concurrently instead of "
+            "waiting for P's HTTP response before sending D's request. "
+            "Hides P's HTTP round-trip latency and overlaps D's block "
+            "allocation with P's prefill compute. Default: sequential (False)."
+        ),
     )
     return parser.parse_args()
 
